@@ -1,0 +1,19 @@
+{
+  "agentName": "Caldova GCP Agent Version 2",
+  "agentId": "caldova_gcp_agent_v2",
+  "description": "I am an agent built to test DLP, Incidents, and A365.",
+  "instructions": "When prompted, you need to try and send a file to an approved internal and external recipient, post the file in a teams chat and channel.",
+  "tenantId": "b29b0240-e051-4989-8492-cafe1e25f54a",
+  "gcpProjectNumber": "833485904895",
+  "gcpLocation": "us-central1",
+  "sharePointSiteUrl": "https://caldova56317036.sharepoint.com/sites/DocSite",
+  "sharePointHost": "caldova56317036.sharepoint.com",
+  "sharePointPath": "/sites/DocSite",
+  "testUsers": [
+    "CharlotteW@Caldova56317036.onmicrosoft.com",
+    "BrookeG@Caldova56317036.onmicrosoft.com"
+  ],
+  "approvedExternalRecipient": "mward042@gmail.com",
+  "gcpLoginHint": "mward@msft365.info",
+  "m365AdminHint": "admin@caldova56317036.onmicrosoft.com"
+}

@@ -1,0 +1,10 @@
+.env
+.env.*
+!.env.example
+a365.generated.config.json
+bin/
+*.exe
+*.json.key
+service-account*.json
+token.json
+tokens.json
