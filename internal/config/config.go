@@ -47,13 +47,15 @@ type Config struct {
 	GCPProjectID    string
 	ClientID        string
 	RuntimeClientID string
-	WorkIQMCPURL   string
-	TeamsTeamID    string
-	TeamsChannelID string
-	ActingUser     string
-	Location       string
-	AgentEngineID  string
-	GeneratedPath  string
+	BlueprintID     string
+	AgentIdentityID string
+	WorkIQMCPURL    string
+	TeamsTeamID     string
+	TeamsChannelID  string
+	ActingUser      string
+	Location        string
+	AgentEngineID   string
+	GeneratedPath   string
 }
 
 func Load() Config {
@@ -104,6 +106,8 @@ func Load() Config {
 		var extra struct {
 			ClientID        string `json:"clientId"`
 			RuntimeClientID string `json:"runtimeClientId"`
+			BlueprintID     string `json:"blueprintId"`
+			AgentIdentityID string `json:"agentIdentityId"`
 			AgentEngineID   string `json:"agentEngineId"`
 			GCPProjectID    string `json:"gcpProjectId"`
 		}
@@ -112,6 +116,8 @@ func Load() Config {
 				cfg.ClientID = extra.ClientID
 			}
 			cfg.RuntimeClientID = extra.RuntimeClientID
+			cfg.BlueprintID = extra.BlueprintID
+			cfg.AgentIdentityID = extra.AgentIdentityID
 			if cfg.AgentEngineID == "" {
 				cfg.AgentEngineID = extra.AgentEngineID
 			}
@@ -146,6 +152,31 @@ func (c Config) OtherTestUser(email string) string {
 		}
 	}
 	return ""
+}
+
+// FunctionUsers are the Caldova users included on every outbound function.
+// Charlotte stays on the list even when another test user is the sender.
+func (c Config) FunctionUsers(acting string) []string {
+	const charlotte = "CharlotteW@Caldova56317036.onmicrosoft.com"
+	seen := map[string]bool{}
+	var out []string
+	add := func(email string) {
+		email = strings.TrimSpace(email)
+		if email == "" || strings.EqualFold(email, acting) {
+			return
+		}
+		key := strings.ToLower(email)
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		out = append(out, email)
+	}
+	add(charlotte)
+	for _, user := range c.TestUsers {
+		add(user)
+	}
+	return out
 }
 
 func (c Config) TokenPath() (string, error) {

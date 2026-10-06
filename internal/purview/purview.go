@@ -21,11 +21,17 @@ type Decision struct {
 }
 
 type Client struct {
-	Token     string
-	AppID     string
-	AppName   string
-	UserEmail string
-	HTTP      *http.Client
+	Token           string
+	AppID           string
+	AppName         string
+	UserEmail       string
+	BlueprintID     string
+	AgentIdentityID string
+	HTTP            *http.Client
+
+	scopeETag   string
+	correlation string
+	sequence    int
 }
 
 func (c *Client) client() *http.Client {
@@ -35,44 +41,114 @@ func (c *Client) client() *http.Client {
 	return http.DefaultClient
 }
 
-// Evaluate sends an interaction to Microsoft Purview processContent so DSPM
-// and DLP can inspect it. Any policy action blocks the activity. Evaluation
-// errors also block, so a send cannot proceed without a monitoring decision.
+// Evaluate sends one interaction to Microsoft Purview. processContent lets the
+// published DLP policy return an action. This agent does not contain policy rules.
 func (c *Client) Evaluate(ctx context.Context, activity, text string) (Decision, error) {
+	return c.Inspect(ctx, activity, text, uuid.NewString(), 1)
+}
+
+// EvaluatePrompt records the user prompt and starts the response pair.
+func (c *Client) EvaluatePrompt(ctx context.Context, text string) (Decision, error) {
+	c.correlation = uuid.NewString()
+	c.sequence = 1
+	return c.Inspect(ctx, "uploadText", text, c.correlation, c.sequence)
+}
+
+// EvaluateResponse records the agent response against the prompt correlation.
+func (c *Client) EvaluateResponse(ctx context.Context, text string) (Decision, error) {
+	if c.correlation == "" {
+		c.correlation = uuid.NewString()
+		c.sequence = 1
+	}
+	c.sequence++
+	return c.Inspect(ctx, "downloadText", text, c.correlation, c.sequence)
+}
+
+// Inspect evaluates one prompt or response and records it for DSPM capture.
+// uploadText is the user prompt. downloadText is the agent response. The same
+// correlation ID and increasing sequence number pair the two in Activity explorer.
+func (c *Client) Inspect(ctx context.Context, activity, text, correlationID string, sequence int) (Decision, error) {
 	if strings.TrimSpace(c.Token) == "" {
 		return Decision{Allowed: false, Reason: "no Microsoft Graph token; run login before the DLP test"}, nil
 	}
-	user := c.UserEmail
-	if user == "" {
-		user = "me"
+	decision, err := c.processContent(ctx, activity, text, correlationID, sequence)
+	if err != nil {
+		return decision, err
 	}
+	if note := c.recordActivity(ctx, activity, correlationID, sequence); note != "" {
+		decision.Reason = strings.TrimSpace(decision.Reason + "; " + note)
+	}
+	return decision, nil
+}
+
+func (c *Client) processContent(ctx context.Context, activity, text, correlationID string, sequence int) (Decision, error) {
+	payload := c.payload(activity, text, correlationID, sequence, true)
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return Decision{}, err
+	}
+	c.refreshScopes(ctx)
+	endpoint := c.endpoint("processContent")
+	respBody, status, err := c.post(ctx, endpoint, body)
+	if err != nil {
+		return Decision{Allowed: false, Reason: "Purview processContent request failed: " + err.Error()}, nil
+	}
+	return Decide(status, respBody), nil
+}
+
+func (c *Client) recordActivity(ctx context.Context, activity, correlationID string, sequence int) string {
+	payload := c.payload(activity, "", correlationID, sequence, false)
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return "contentActivities payload failed: " + err.Error()
+	}
+	respBody, status, err := c.post(ctx, c.endpoint("activities/contentActivities"), body)
+	if err != nil {
+		return "contentActivities request failed: " + err.Error()
+	}
+	if status < 200 || status >= 300 {
+		return "contentActivities was not recorded: " + truncate(string(respBody), 300)
+	}
+	return "contentActivities recorded " + activity
+}
+
+func (c *Client) payload(activity, text, correlationID string, sequence int, includeContent bool) map[string]any {
 	now := time.Now().UTC().Format(time.RFC3339)
-	payload := map[string]any{
+	if correlationID == "" {
+		correlationID = uuid.NewString()
+	}
+	if sequence < 1 {
+		sequence = 1
+	}
+	entry := map[string]any{
+		"@odata.type":      "microsoft.graph.processConversationMetadata",
+		"identifier":       uuid.NewString(),
+		"name":             c.AppName,
+		"correlationId":    correlationID,
+		"sequenceNumber":   sequence,
+		"isTruncated":      len(text) > 12000,
+		"createdDateTime":  now,
+		"modifiedDateTime": now,
+		"agents":           c.agents(),
+	}
+	if includeContent {
+		entry["contentCategory"] = "ai"
+		entry["content"] = map[string]any{
+			"@odata.type": "microsoft.graph.textContent",
+			"data":        truncate(text, 12000),
+		}
+	}
+	return map[string]any{
 		"contentToProcess": map[string]any{
-			"contentEntries": []any{
-				map[string]any{
-					"@odata.type":      "microsoft.graph.processConversationMetadata",
-					"identifier":       uuid.NewString(),
-					"name":             c.AppName,
-					"correlationId":    uuid.NewString(),
-					"sequenceNumber":   0,
-					"isTruncated":      false,
-					"createdDateTime":  now,
-					"modifiedDateTime": now,
-					"contentCategory":  "ai",
-					"content": map[string]any{
-						"@odata.type": "microsoft.graph.textContent",
-						"data":        truncate(text, 12000),
-					},
-				},
-			},
+			"contentEntries":   []any{entry},
 			"activityMetadata": map[string]any{"activity": activity},
 			"deviceMetadata": map[string]any{
-				"deviceType": "Unmanaged",
 				"operatingSystemSpecifications": map[string]any{
-					"operatingSystemPlatform": "Windows",
-					"operatingSystemVersion":  "10.0",
+					"operatingSystemPlatform": "Windows 11",
+					"operatingSystemVersion":  "10.0.26100.0",
 				},
+				"deviceType": "Unmanaged",
+				"ipAddress":  "127.0.0.1",
 			},
 			"protectedAppMetadata": map[string]any{
 				"name":    c.AppName,
@@ -88,28 +164,91 @@ func (c *Client) Evaluate(ctx context.Context, activity, text string) (Decision,
 			},
 		},
 	}
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return Decision{}, err
+}
+
+func (c *Client) agents() []any {
+	agent := map[string]any{
+		"name":    c.AppName,
+		"version": "2.0",
 	}
-	endpoint := fmt.Sprintf("https://graph.microsoft.com/beta/users/%s/dataSecurityAndGovernance/processContent", url.PathEscape(user))
-	if user == "me" {
-		endpoint = "https://graph.microsoft.com/beta/me/dataSecurityAndGovernance/processContent"
+	if c.AgentIdentityID != "" {
+		agent["identifier"] = c.AgentIdentityID
+	} else {
+		agent["identifier"] = c.AppID
 	}
+	if c.BlueprintID != "" {
+		agent["blueprintId"] = c.BlueprintID
+	}
+	return []any{agent}
+}
+
+func (c *Client) endpoint(action string) string {
+	user := c.UserEmail
+	if user == "" || user == "me" {
+		return "https://graph.microsoft.com/beta/me/dataSecurityAndGovernance/" + action
+	}
+	return fmt.Sprintf("https://graph.microsoft.com/beta/users/%s/dataSecurityAndGovernance/%s", url.PathEscape(user), action)
+}
+
+func (c *Client) post(ctx context.Context, endpoint string, body []byte) ([]byte, int, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
-		return Decision{}, err
+		return nil, 0, err
 	}
 	req.Header.Set("Authorization", "Bearer "+c.Token)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Client-Request-Id", uuid.NewString())
+	if c.scopeETag != "" && strings.HasSuffix(endpoint, "/processContent") {
+		req.Header.Set("If-None-Match", c.scopeETag)
+	}
 	resp, err := c.client().Do(req)
 	if err != nil {
-		return Decision{Allowed: false, Reason: "Purview processContent request failed: " + err.Error()}, nil
+		return nil, 0, err
 	}
 	defer resp.Body.Close()
+	if etag := resp.Header.Get("ETag"); etag != "" {
+		c.scopeETag = etag
+	}
 	respBody, _ := io.ReadAll(resp.Body)
-	return Decide(resp.StatusCode, respBody), nil
+	return respBody, resp.StatusCode, nil
+}
+
+// refreshScopes asks Purview which published policies apply to this application.
+// An empty result means no policy currently covers the user. It is not a local policy.
+func (c *Client) refreshScopes(ctx context.Context) {
+	if strings.TrimSpace(c.Token) == "" || c.AppID == "" {
+		return
+	}
+	body, err := json.Marshal(map[string]any{
+		"activities": "uploadText,downloadText,uploadFile,downloadFile",
+		"locations": []any{map[string]any{
+			"@odata.type": "microsoft.graph.policyLocationApplication",
+			"value":       c.AppID,
+		}},
+		"integratedAppMetadata": map[string]any{"name": c.AppName, "version": "2.0"},
+	})
+	if err != nil {
+		return
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint("protectionScopes/compute"), bytes.NewReader(body))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+c.Token)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Client-Request-Id", uuid.NewString())
+	if c.scopeETag != "" {
+		req.Header.Set("If-None-Match", c.scopeETag)
+	}
+	resp, err := c.client().Do(req)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	if etag := resp.Header.Get("ETag"); etag != "" {
+		c.scopeETag = etag
+	}
 }
 
 func Decide(status int, body []byte) Decision {

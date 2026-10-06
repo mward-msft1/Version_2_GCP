@@ -80,14 +80,16 @@ func main() {
 		Config: cfg,
 		Graph:  &m365.Client{},
 		Purview: &purview.Client{
-			AppID:   firstNonEmpty(cfg.RuntimeClientID, cfg.ClientID),
-			AppName: cfg.AgentName,
+			AppID:           firstNonEmpty(cfg.RuntimeClientID, cfg.ClientID),
+			AppName:         cfg.AgentName,
+			BlueprintID:     cfg.BlueprintID,
+			AgentIdentityID: cfg.AgentIdentityID,
 		},
 		WorkIQ: &workiq.Client{URL: cfg.WorkIQMCPURL},
 	}
 	dlpTool, err := functiontool.New(functiontool.Config{
 		Name:        "run_dlp_test",
-		Description: "Runs the DocSite DLP test: Purview inspection, then email to an approved internal user and the approved external recipient, plus a Teams chat and channel post. A Purview block is a successful test and stops that action.",
+		Description: "Runs the DocSite DLP test: Purview inspection, then email to CharlotteW and BrookeG and the approved external recipient, plus a Teams chat with each of them and a Teams channel post. A Purview block is a successful test and stops that action.",
 	}, func(ctx agent.Context, req scenario.Request) (scenario.Report, error) {
 		if err := bindToken(cfg, runner); err != nil {
 			return scenario.Report{}, err
@@ -110,7 +112,7 @@ func main() {
 				if err := bindToken(cfg, runner); err != nil {
 					return blocked(err.Error()), nil
 				}
-				decision, err := runner.Purview.Evaluate(ctx, "uploadText", requestText(req))
+				decision, err := runner.Purview.EvaluatePrompt(ctx, requestText(req))
 				if err != nil {
 					return blocked(err.Error()), nil
 				}
@@ -125,7 +127,7 @@ func main() {
 				if respErr != nil || resp == nil || resp.Content == nil {
 					return nil, nil
 				}
-				_, _ = runner.Purview.Evaluate(ctx, "uploadText", contentText(resp.Content))
+				_, _ = runner.Purview.EvaluateResponse(ctx, contentText(resp.Content))
 				return nil, nil
 			},
 		},
@@ -224,8 +226,10 @@ func runTest(cfg config.Config) error {
 		Config: cfg,
 		Graph:  &m365.Client{},
 		Purview: &purview.Client{
-			AppID:   firstNonEmpty(cfg.RuntimeClientID, cfg.ClientID),
-			AppName: cfg.AgentName,
+			AppID:           firstNonEmpty(cfg.RuntimeClientID, cfg.ClientID),
+			AppName:         cfg.AgentName,
+			BlueprintID:     cfg.BlueprintID,
+			AgentIdentityID: cfg.AgentIdentityID,
 		},
 		WorkIQ: &workiq.Client{URL: cfg.WorkIQMCPURL},
 	}

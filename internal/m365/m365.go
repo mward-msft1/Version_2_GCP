@@ -138,7 +138,7 @@ func (c *Client) PrepareFile(ctx context.Context, driveID string, item DriveItem
 	return payload, nil
 }
 
-func (c *Client) SendMail(ctx context.Context, to, subject, bodyText string, file FilePayload) error {
+func (c *Client) SendMail(ctx context.Context, to string, cc []string, subject, bodyText string, file FilePayload) error {
 	attachment := map[string]any{}
 	if len(file.Bytes) > 0 {
 		attachment = map[string]any{
@@ -156,6 +156,18 @@ func (c *Client) SendMail(ctx context.Context, to, subject, bodyText string, fil
 		"toRecipients": []any{
 			map[string]any{"emailAddress": map[string]any{"address": to}},
 		},
+	}
+	if len(cc) > 0 {
+		var copied []any
+		for _, address := range cc {
+			if strings.EqualFold(address, to) {
+				continue
+			}
+			copied = append(copied, map[string]any{"emailAddress": map[string]any{"address": address}})
+		}
+		if len(copied) > 0 {
+			message["ccRecipients"] = copied
+		}
 	}
 	if len(attachment) > 0 {
 		message["attachments"] = []any{attachment}
