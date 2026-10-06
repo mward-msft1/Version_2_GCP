@@ -22,6 +22,7 @@ var registerScopes = []string{
 	"AgentIdentityBlueprint.ReadWrite.All",
 	"AgentIdentityBlueprintPrincipal.Create",
 	"Application.ReadWrite.All",
+	"DelegatedPermissionGrant.ReadWrite.All",
 	"User.Read",
 	"AgentRegistration.ReadWrite.All",
 	"offline_access",
@@ -37,21 +38,23 @@ var runtimeScopes = []string{
 	"Team.ReadBasic.All",
 	"Channel.ReadBasic.All",
 	"Content.Process.User",
+	"ContentActivity.Write",
+	"ProtectionScopes.Compute.User",
 	"offline_access",
 }
 
 type Result struct {
-	BlueprintAppID   string   `json:"blueprintAppId"`
-	BlueprintID      string   `json:"blueprintId"`
-	PrincipalID      string   `json:"principalId,omitempty"`
+	BlueprintAppID      string   `json:"blueprintAppId"`
+	BlueprintID         string   `json:"blueprintId"`
+	PrincipalID         string   `json:"principalId,omitempty"`
 	AgentIdentityID     string   `json:"agentIdentityId,omitempty"`
 	AgentRegistrationID string   `json:"agentRegistrationId,omitempty"`
 	SignedInUser        string   `json:"signedInUser,omitempty"`
 	ClientID            string   `json:"clientId"`
 	RuntimeClientID     string   `json:"runtimeClientId,omitempty"`
-	TenantID         string   `json:"tenantId"`
-	AdminConsentURL  string   `json:"adminConsentUrl"`
-	Warnings         []string `json:"warnings,omitempty"`
+	TenantID            string   `json:"tenantId"`
+	AdminConsentURL     string   `json:"adminConsentUrl"`
+	Warnings            []string `json:"warnings,omitempty"`
 }
 
 func Run(ctx context.Context, cfg config.Config) (Result, error) {
@@ -81,6 +84,13 @@ func Run(ctx context.Context, cfg config.Config) (Result, error) {
 	if err != nil {
 		return Result{}, fmt.Errorf("read signed-in user: %w", err)
 	}
+	if cfg.ClientID == "" {
+		if existing, err := existingBlueprintAppID(ctx, token, cfg.AgentName); err != nil {
+			return Result{}, err
+		} else if existing != "" {
+			cfg.ClientID = existing
+		}
+	}
 	if cfg.ClientID != "" {
 		return repair(ctx, cfg, token, sponsorID, signedIn)
 	}
@@ -99,7 +109,7 @@ func Run(ctx context.Context, cfg config.Config) (Result, error) {
 		return Result{}, fmt.Errorf("create agent identity blueprint: %w", err)
 	}
 	result := Result{
-		SignedInUser: signedIn,
+		SignedInUser:   signedIn,
 		BlueprintAppID: str(blueprint, "appId"),
 		BlueprintID:    str(blueprint, "id"),
 		TenantID:       cfg.TenantID,
@@ -371,7 +381,7 @@ func requiredAccess(ctx context.Context, token string) (map[string]any, []string
 	if len(sp.Value) == 0 {
 		return nil, nil, fmt.Errorf("Microsoft Graph service principal was not found")
 	}
-	want := []string{"User.Read", "Sites.Read.All", "Files.Read.All", "Mail.Send", "Chat.ReadWrite", "ChannelMessage.Send", "Team.ReadBasic.All", "Channel.ReadBasic.All", "Content.Process.User"}
+	want := []string{"User.Read", "Sites.Read.All", "Files.Read.All", "Mail.Send", "Chat.ReadWrite", "ChannelMessage.Send", "Team.ReadBasic.All", "Channel.ReadBasic.All", "Content.Process.User", "ContentActivity.Write", "ProtectionScopes.Compute.User"}
 	var scopes []any
 	var missing []string
 	for _, name := range want {
@@ -397,26 +407,36 @@ func requiredAccess(ctx context.Context, token string) (map[string]any, []string
 
 func writeGenerated(cfg config.Config, result Result) error {
 	payload := map[string]any{
-		"agentName":        cfg.AgentName,
-		"tenantId":         cfg.TenantID,
-		"gcpProjectNumber": cfg.GCPProjectNumber,
-		"clientId":         result.ClientID,
-		"runtimeClientId":  result.RuntimeClientID,
-		"blueprintAppId":   result.BlueprintAppID,
-		"blueprintId":      result.BlueprintID,
-		"principalId":      result.PrincipalID,
-		"agentIdentityId":       result.AgentIdentityID,
-		"agentRegistrationId":   result.AgentRegistrationID,
-		"signedInUser":          result.SignedInUser,
-		"registrationTenantId":  config.TenantID,
-		"adminConsentUrl":  result.AdminConsentURL,
-		"warnings":         result.Warnings,
+		"agentName":            cfg.AgentName,
+		"tenantId":             cfg.TenantID,
+		"gcpProjectNumber":     cfg.GCPProjectNumber,
+		"clientId":             result.ClientID,
+		"runtimeClientId":      result.RuntimeClientID,
+		"blueprintAppId":       result.BlueprintAppID,
+		"blueprintId":          result.BlueprintID,
+		"principalId":          result.PrincipalID,
+		"agentIdentityId":      result.AgentIdentityID,
+		"agentRegistrationId":  result.AgentRegistrationID,
+		"signedInUser":         result.SignedInUser,
+		"registrationTenantId": config.TenantID,
+		"adminConsentUrl":      result.AdminConsentURL,
+		"warnings":             result.Warnings,
 		"dspm": map[string]string{
 			"applicationId":    result.RuntimeClientID,
 			"agentBlueprintId": result.BlueprintAppID,
 			"note":             "DSPM sees the runtime public client that calls processContent. Scope the Purview collection policy to that application ID. The Agent 365 blueprint remains the agent identity.",
 		},
 		"vertexSync": "After adkgo deploy, connect Google Vertex AI in Microsoft 365 admin center > Agents > Connected platforms and sync project " + cfg.GCPProjectNumber + " in " + cfg.Location + ".",
+	}
+	if previous, err := os.ReadFile(cfg.GeneratedPath); err == nil {
+		var existing map[string]any
+		if json.Unmarshal(previous, &existing) == nil {
+			for _, key := range []string{"reasoningEngine", "gcpProjectId", "agentEngineId"} {
+				if _, ok := payload[key]; !ok && existing[key] != nil {
+					payload[key] = existing[key]
+				}
+			}
+		}
 	}
 	b, err := json.MarshalIndent(payload, "", "  ")
 	if err != nil {
@@ -502,13 +522,27 @@ func configureBlueprint(ctx context.Context, token, blueprintID string, cfg conf
 
 func ensureRuntimeClient(ctx context.Context, token string, cfg config.Config, existing string, access map[string]any) (string, error) {
 	if existing != "" {
-		var found struct {
-			Value []struct {
-				AppID string `json:"appId"`
-			} `json:"value"`
-		}
-		endpoint := "https://graph.microsoft.com/v1.0/applications?$filter=" + url.QueryEscape("appId eq '"+existing+"'") + "&$select=appId"
-		if err := graphInto(ctx, token, http.MethodGet, endpoint, nil, &found); err == nil && len(found.Value) > 0 {
+		objectID, err := applicationObjectID(ctx, token, existing)
+		if err == nil && objectID != "" {
+			if access != nil {
+				if _, err := graphJSON(ctx, token, http.MethodPatch, "https://graph.microsoft.com/v1.0/applications/"+url.PathEscape(objectID), map[string]any{
+					"requiredResourceAccess": []any{access},
+				}); err != nil {
+					return existing, fmt.Errorf("runtime permission update failed: %w", err)
+				}
+			}
+			var principals struct {
+				Value []struct {
+					ID string `json:"id"`
+				} `json:"value"`
+			}
+			spEndpoint := "https://graph.microsoft.com/v1.0/servicePrincipals?$filter=" + url.QueryEscape("appId eq '"+existing+"'") + "&$select=id"
+			if err := graphInto(ctx, token, http.MethodGet, spEndpoint, nil, &principals); err != nil || len(principals.Value) == 0 {
+				return existing, fmt.Errorf("runtime service principal was not found")
+			}
+			if err := grantAdminConsent(ctx, token, principals.Value[0].ID); err != nil {
+				return existing, fmt.Errorf("runtime admin consent was not updated: %w", err)
+			}
 			return existing, nil
 		}
 	}
@@ -555,12 +589,36 @@ func grantAdminConsent(ctx context.Context, token, principalID string) error {
 	if len(graphSP.Value) == 0 {
 		return fmt.Errorf("Microsoft Graph service principal was not found")
 	}
+	scope := strings.Join(runtimeScopes[:len(runtimeScopes)-1], " ")
 	_, err := graphJSON(ctx, token, http.MethodPost, "https://graph.microsoft.com/v1.0/oauth2PermissionGrants", map[string]any{
 		"clientId":    principalID,
 		"consentType": "AllPrincipals",
 		"resourceId":  graphSP.Value[0].ID,
-		"scope":       strings.Join(runtimeScopes[:len(runtimeScopes)-1], " "),
+		"scope":       scope,
 	})
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "already exists") {
+		return err
+	}
+	var grants struct {
+		Value []struct {
+			ID         string `json:"id"`
+			ClientID   string `json:"clientId"`
+			ResourceID string `json:"resourceId"`
+		} `json:"value"`
+	}
+	list := "https://graph.microsoft.com/v1.0/oauth2PermissionGrants?$filter=" + url.QueryEscape("clientId eq '"+principalID+"'")
+	if listErr := graphInto(ctx, token, http.MethodGet, list, nil, &grants); listErr != nil {
+		return err
+	}
+	for _, grant := range grants.Value {
+		if !strings.EqualFold(grant.ResourceID, graphSP.Value[0].ID) {
+			continue
+		}
+		_, patchErr := graphJSON(ctx, token, http.MethodPatch, "https://graph.microsoft.com/v1.0/oauth2PermissionGrants/"+url.PathEscape(grant.ID), map[string]any{
+			"scope": scope,
+		})
+		return patchErr
+	}
 	return err
 }
 
@@ -648,6 +706,35 @@ func firstString(claims map[string]any, keys ...string) string {
 		}
 	}
 	return ""
+}
+
+func existingBlueprintAppID(ctx context.Context, token, name string) (string, error) {
+	var body struct {
+		Value []struct {
+			AppID string `json:"appId"`
+			Type  string `json:"@odata.type"`
+		} `json:"value"`
+	}
+	endpoint := "https://graph.microsoft.com/v1.0/applications?$filter=" + url.QueryEscape("displayName eq '"+strings.ReplaceAll(name, "'", "''")+"'") + "&$select=appId"
+	if err := graphInto(ctx, token, http.MethodGet, endpoint, nil, &body); err != nil {
+		return "", err
+	}
+	var ids []string
+	for _, app := range body.Value {
+		if app.AppID == "" {
+			continue
+		}
+		if app.Type == "" || strings.Contains(strings.ToLower(app.Type), "agentidentityblueprint") {
+			ids = append(ids, app.AppID)
+		}
+	}
+	if len(ids) > 1 {
+		return "", fmt.Errorf("multiple Agent 365 blueprints are named %s; keep the original and remove the duplicate before registering again", name)
+	}
+	if len(ids) == 1 {
+		return ids[0], nil
+	}
+	return "", nil
 }
 
 func applicationObjectID(ctx context.Context, token, appID string) (string, error) {

@@ -13,9 +13,9 @@ $Applications = @(
         AppName = "Caldova GCP Agent Version 2"
     }
 )
-$AlertRecipients     = @("admin@caldova56317036.onmicrosoft.com")
-$IncidentRecipients  = @("admin@caldova56317036.onmicrosoft.com")
-$NotifyRecipients    = @("admin@caldova56317036.onmicrosoft.com")
+$AlertRecipients     = @("admin@caldova56317036.onmicrosoft.com", "CharlotteW@Caldova56317036.onmicrosoft.com")
+$IncidentRecipients  = @("admin@caldova56317036.onmicrosoft.com", "CharlotteW@Caldova56317036.onmicrosoft.com")
+$NotifyRecipients    = @("admin@caldova56317036.onmicrosoft.com", "CharlotteW@Caldova56317036.onmicrosoft.com")
 $ReportSeverityLevel = "High"
 $SensitiveTypes = @(
     @{ Name = "Credit Card Number"; minCount = "1" },
@@ -193,6 +193,29 @@ foreach ($dlRule in @(
     Write-Host "$($dlRule.Name) created."
 }
 Set-DlpCompliancePolicy -Identity $TeamsPolicyName -Mode Enable | Out-Null
+
+$CollectionName = "DSPM for AI - Collection policy for enterprise AI apps"
+$CollectionConfig = '{"Activities":["UploadText","DownloadText"],"EnforcementPlanes":["Application"],"SensitiveTypeIds":["All"],"IsIngestionEnabled":true}'
+$CollectionLocation = @{
+    Workload            = "Applications"
+    Location            = $Applications[0].AppId
+    LocationDisplayName = $Applications[0].AppName
+    LocationSource      = "Entra"
+    LocationType        = "Individual"
+    Inclusions          = @(@{ Type = "Tenant"; Identity = "All" })
+}
+$CollectionJson = $CollectionLocation | ConvertTo-Json -Depth 6 -Compress
+if ($CollectionJson.TrimStart().StartsWith("{")) { $CollectionJson = "[$CollectionJson]" }
+Write-Host "Ensuring collection policy '$CollectionName' stores prompts and responses..."
+$existingCollection = Get-FeatureConfiguration -FeatureScenario KnowYourData -Identity $CollectionName -ErrorAction SilentlyContinue
+if (-not $existingCollection) {
+    New-FeatureConfiguration -FeatureScenario KnowYourData -Name $CollectionName -Mode Enable -ScenarioConfig $CollectionConfig -Locations $CollectionJson | Out-Null
+    Write-Host "Collection policy created with ingestion enabled."
+}
+else {
+    Set-FeatureConfiguration -Identity $CollectionName -Mode Enable -ScenarioConfig $CollectionConfig -Locations $CollectionJson | Out-Null
+    Write-Host "Collection policy updated with ingestion enabled."
+}
 
 Write-Host "Verification:"
 Get-DlpCompliancePolicy -Identity $DlpPolicyName | Format-List Name, Mode, Enabled, DistributionStatus, EnforcementPlanes, ExchangeLocation, SharePointLocation, OneDriveLocation, TeamsLocation, Locations
