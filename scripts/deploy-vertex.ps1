@@ -1,6 +1,11 @@
 $ErrorActionPreference = "Stop"
 Set-Location (Split-Path -Parent $PSScriptRoot)
 
+$credPath = Join-Path $env:APPDATA "caldova-gcp-agent\blueprint-credential.json"
+if (-not (Test-Path $credPath)) { throw "Blueprint credential is missing. Run activity once locally before deploying hosted telemetry." }
+$blueprintSecret = [string](Get-Content -Raw $credPath | ConvertFrom-Json).secretText
+if (-not $blueprintSecret) { throw "Blueprint credential has no secret. Hosted Agent 365 telemetry cannot start." }
+
 $projectNumber = "833485904895"
 $location = if ($env:GOOGLE_CLOUD_LOCATION) { $env:GOOGLE_CLOUD_LOCATION } else { "us-central1" }
 if (-not (Get-Command gcloud -ErrorAction SilentlyContinue)) {
@@ -50,8 +55,17 @@ WORKDIR /app
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "-s -w" -o caldova-gcp-agent main.go
 
-FROM gcr.io/distroless/static-debian11
+FROM python:3.12-slim-bookworm
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 COPY --from=builder /app/caldova-gcp-agent /app/caldova-gcp-agent
+COPY a365.generated.config.json /app/a365.generated.config.json
+COPY observability /app/observability
+ENV A365_PYTHON=/usr/local/bin/python
+ENV ENABLE_OBSERVABILITY=true
+ENV ENABLE_A365_OBSERVABILITY_EXPORTER=true
+ENV A365_USE_S2S_ENDPOINT=true
 EXPOSE 8080
 CMD ["/app/caldova-gcp-agent", "web", "-port", "8080", "agentengine"]
 '@ | Set-Content -Encoding ascii (Join-Path $stage "Dockerfile")
@@ -78,6 +92,12 @@ CMD ["/app/caldova-gcp-agent", "web", "-port", "8080", "agentengine"]
                     @{ name = "NUM_WORKERS"; value = "1" }
                     @{ name = "GOOGLE_CLOUD_AGENT_ENGINE_ENABLE_TELEMETRY"; value = "true" }
                     @{ name = "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT"; value = "true" }
+                    @{ name = "WORKIQ_MCP_URL"; value = "https://workiq.svc.cloud.microsoft/mcp" }
+                    @{ name = "A365_PYTHON"; value = "/usr/local/bin/python" }
+                    @{ name = "ENABLE_OBSERVABILITY"; value = "true" }
+                    @{ name = "ENABLE_A365_OBSERVABILITY_EXPORTER"; value = "true" }
+                    @{ name = "A365_USE_S2S_ENDPOINT"; value = "true" }
+                    @{ name = "A365_BLUEPRINT_SECRET"; value = $blueprintSecret }
                 )
             }
             classMethods = $methods
@@ -130,6 +150,7 @@ CMD ["/app/caldova-gcp-agent", "web", "-port", "8080", "agentengine"]
     }
 } finally {
     if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
+    if ($jsonPath -and (Test-Path $jsonPath)) { Remove-Item -Force $jsonPath }
 }
 
 Write-Host "After deploy, connect Google Vertex AI in Microsoft 365 admin center > Agents > Connected platforms."

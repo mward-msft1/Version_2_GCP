@@ -97,12 +97,13 @@ func (c *Client) processContent(ctx context.Context, activity, text, correlation
 }
 
 func (c *Client) recordActivity(ctx context.Context, activity, correlationID string, sequence int) string {
-	payload := c.payload(activity, "", correlationID, sequence, false)
-	body, err := json.Marshal(payload)
+	body, err := json.Marshal(c.activityPayload(activity, correlationID, sequence))
 	if err != nil {
 		return "contentActivities payload failed: " + err.Error()
 	}
-	respBody, status, err := c.post(ctx, c.endpoint("activities/contentActivities"), body)
+	// contentActivity is a v1.0 resource. The beta route returns 500 for this
+	// payload, and the body property is contentMetadata, not contentToProcess.
+	respBody, status, err := c.post(ctx, c.versionedEndpoint("v1.0", "activities/contentActivities"), body)
 	if err != nil {
 		return "contentActivities request failed: " + err.Error()
 	}
@@ -166,10 +167,57 @@ func (c *Client) payload(activity, text, correlationID string, sequence int, inc
 	}
 }
 
+func (c *Client) activityPayload(activity, correlationID string, sequence int) map[string]any {
+	now := time.Now().UTC().Format("2006-01-02T15:04:05")
+	if correlationID == "" {
+		correlationID = uuid.NewString()
+	}
+	if sequence < 0 {
+		sequence = 0
+	}
+	entry := map[string]any{
+		"@odata.type":      "microsoft.graph.processConversationMetadata",
+		"identifier":       uuid.NewString(),
+		"name":             c.AppName + " " + activity,
+		"correlationId":    correlationID,
+		"sequenceNumber":   sequence,
+		"isTruncated":      false,
+		"createdDateTime":  now,
+		"modifiedDateTime": now,
+		"agents":           c.agents(),
+	}
+	return map[string]any{
+		"contentMetadata": map[string]any{
+			"contentEntries":   []any{entry},
+			"activityMetadata": map[string]any{"activity": activity},
+			"deviceMetadata": map[string]any{
+				"operatingSystemSpecifications": map[string]any{
+					"operatingSystemPlatform": "Windows 11",
+					"operatingSystemVersion":  "10.0.26100.0",
+				},
+				"ipAddress": "127.0.0.1",
+			},
+			"protectedAppMetadata": map[string]any{
+				"name":    c.AppName,
+				"version": "2.0",
+				"applicationLocation": map[string]any{
+					"@odata.type": "microsoft.graph.policyLocationApplication",
+					"value":       c.AppID,
+				},
+			},
+			"integratedAppMetadata": map[string]any{
+				"name":    c.AppName,
+				"version": "2.0",
+			},
+		},
+	}
+}
+
 func (c *Client) agents() []any {
 	agent := map[string]any{
-		"name":    c.AppName,
-		"version": "2.0",
+		"@odata.type": "microsoft.graph.aiAgentInfo",
+		"name":        c.AppName,
+		"version":     "2.0",
 	}
 	if c.AgentIdentityID != "" {
 		agent["identifier"] = c.AgentIdentityID
@@ -183,11 +231,15 @@ func (c *Client) agents() []any {
 }
 
 func (c *Client) endpoint(action string) string {
+	return c.versionedEndpoint("beta", action)
+}
+
+func (c *Client) versionedEndpoint(version, action string) string {
 	user := c.UserEmail
 	if user == "" || user == "me" {
-		return "https://graph.microsoft.com/beta/me/dataSecurityAndGovernance/" + action
+		return "https://graph.microsoft.com/" + version + "/me/dataSecurityAndGovernance/" + action
 	}
-	return fmt.Sprintf("https://graph.microsoft.com/beta/users/%s/dataSecurityAndGovernance/%s", url.PathEscape(user), action)
+	return fmt.Sprintf("https://graph.microsoft.com/%s/users/%s/dataSecurityAndGovernance/%s", version, url.PathEscape(user), action)
 }
 
 func (c *Client) post(ctx context.Context, endpoint string, body []byte) ([]byte, int, error) {

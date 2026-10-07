@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -8,16 +9,17 @@ import (
 )
 
 const (
-	AgentDisplayName = "Caldova GCP Agent Version 2"
-	AgentID          = "caldova_gcp_agent_v2"
-	Description      = "I am an agent built to test DLP, Incidents, and A365."
-	UserInstruction  = "When prompted, you need to try and send a file to an approved internal and external recipient, post the file in a teams chat and channel."
-	TenantID         = "b29b0240-e051-4989-8492-cafe1e25f54a"
-	GCPProjectNumber = "833485904895"
-	SharePointHost   = "caldova56317036.sharepoint.com"
-	SharePointPath   = "/sites/DocSite"
-	ExternalEmail    = "mward042@gmail.com"
-	GraphAppID       = "00000003-0000-0000-c000-000000000000"
+	AgentDisplayName    = "Caldova GCP Agent Version 2"
+	AgentID             = "caldova_gcp_agent_v2"
+	Description         = "I am an agent built to test DLP, Incidents, and A365."
+	UserInstruction     = "When prompted, you need to try and send a file to an approved internal and external recipient, post the file in a teams chat and channel."
+	TenantID            = "b29b0240-e051-4989-8492-cafe1e25f54a"
+	GCPProjectNumber    = "833485904895"
+	SharePointHost      = "caldova56317036.sharepoint.com"
+	SharePointPath      = "/sites/DocSite"
+	ExternalEmail       = "mward042@gmail.com"
+	DefaultWorkIQMCPURL = "https://workiq.svc.cloud.microsoft/mcp"
+	GraphAppID          = "00000003-0000-0000-c000-000000000000"
 	// Microsoft Graph Command Line Tools, a first-party public client used only
 	// to bootstrap Agent 365 registration. No secret is stored.
 	BootstrapClientID = "14d82eec-204b-4c2f-b7e8-296a70dab67e"
@@ -95,6 +97,12 @@ func Load() Config {
 	}
 	cfg.ClientID = os.Getenv("AZURE_CLIENT_ID")
 	cfg.WorkIQMCPURL = os.Getenv("WORKIQ_MCP_URL")
+	if cfg.WorkIQMCPURL == "" {
+		cfg.WorkIQMCPURL = DefaultWorkIQMCPURL
+	}
+	if strings.EqualFold(cfg.WorkIQMCPURL, "off") || strings.EqualFold(cfg.WorkIQMCPURL, "none") {
+		cfg.WorkIQMCPURL = ""
+	}
 	cfg.TeamsTeamID = os.Getenv("TEAMS_TEAM_ID")
 	cfg.TeamsChannelID = os.Getenv("TEAMS_CHANNEL_ID")
 	cfg.ActingUser = os.Getenv("ACTING_USER")
@@ -102,7 +110,17 @@ func Load() Config {
 		cfg.ActingUser = cfg.TestUsers[0]
 	}
 	cfg.AgentEngineID = os.Getenv("GOOGLE_CLOUD_AGENT_ENGINE_ID")
-	if gen, err := os.ReadFile(cfg.GeneratedPath); err == nil {
+	applyGenerated(&cfg)
+	return cfg
+}
+
+func applyGenerated(cfg *Config) {
+	for _, path := range generatedCandidates(cfg.GeneratedPath) {
+		gen, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		gen = bytes.TrimPrefix(gen, []byte{0xEF, 0xBB, 0xBF})
 		var extra struct {
 			ClientID        string `json:"clientId"`
 			RuntimeClientID string `json:"runtimeClientId"`
@@ -111,22 +129,32 @@ func Load() Config {
 			AgentEngineID   string `json:"agentEngineId"`
 			GCPProjectID    string `json:"gcpProjectId"`
 		}
-		if json.Unmarshal(gen, &extra) == nil {
-			if cfg.ClientID == "" {
-				cfg.ClientID = extra.ClientID
-			}
-			cfg.RuntimeClientID = extra.RuntimeClientID
-			cfg.BlueprintID = extra.BlueprintID
-			cfg.AgentIdentityID = extra.AgentIdentityID
-			if cfg.AgentEngineID == "" {
-				cfg.AgentEngineID = extra.AgentEngineID
-			}
-			if extra.GCPProjectID != "" && os.Getenv("GOOGLE_CLOUD_PROJECT") == "" && extra.GCPProjectID != cfg.GCPProjectNumber {
-				cfg.GCPProjectID = extra.GCPProjectID
-			}
+		if json.Unmarshal(gen, &extra) != nil {
+			continue
 		}
+		if cfg.ClientID == "" {
+			cfg.ClientID = extra.ClientID
+		}
+		cfg.RuntimeClientID = extra.RuntimeClientID
+		cfg.BlueprintID = extra.BlueprintID
+		cfg.AgentIdentityID = extra.AgentIdentityID
+		if cfg.AgentEngineID == "" {
+			cfg.AgentEngineID = extra.AgentEngineID
+		}
+		if extra.GCPProjectID != "" && os.Getenv("GOOGLE_CLOUD_PROJECT") == "" && extra.GCPProjectID != cfg.GCPProjectNumber {
+			cfg.GCPProjectID = extra.GCPProjectID
+		}
+		cfg.GeneratedPath = path
+		return
 	}
-	return cfg
+}
+
+func generatedCandidates(primary string) []string {
+	candidates := []string{primary, filepath.Join("/app", "a365.generated.config.json")}
+	if exe, err := os.Executable(); err == nil {
+		candidates = append(candidates, filepath.Join(filepath.Dir(exe), "a365.generated.config.json"))
+	}
+	return candidates
 }
 
 func (c Config) ApprovedRecipients() []string {

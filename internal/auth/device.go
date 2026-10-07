@@ -49,6 +49,48 @@ func (c *Client) CachedToken() (string, error) {
 	return tok.AccessToken, nil
 }
 
+// Refresh returns a cached token, renewing it with the refresh token when it is near expiry.
+// It never starts a device-code prompt.
+func (c *Client) Refresh(ctx context.Context) (string, error) {
+	tok, err := c.read()
+	if err != nil {
+		return "", err
+	}
+	if tok.AccessToken != "" && time.Until(tok.ExpiresAt) > time.Minute {
+		return tok.AccessToken, nil
+	}
+	if tok.RefreshToken == "" {
+		return "", fmt.Errorf("cached token is missing or expired; run login")
+	}
+	refreshed, err := c.refresh(ctx, tok.RefreshToken)
+	if err != nil {
+		return "", err
+	}
+	return refreshed.AccessToken, nil
+}
+
+// DeviceToken always starts a new device-code sign-in. Use it when the cached
+// runtime token belongs to a different test user.
+func (c *Client) DeviceToken(ctx context.Context) (string, error) {
+	fresh, err := c.deviceCode(ctx)
+	if err != nil {
+		return "", err
+	}
+	return fresh.AccessToken, nil
+}
+
+func (c *Client) Snapshot() (Token, bool) {
+	tok, err := c.read()
+	if err != nil {
+		return Token{}, false
+	}
+	return tok, true
+}
+
+func (c *Client) Restore(tok Token) error {
+	return c.write(tok)
+}
+
 func (c *Client) Token(ctx context.Context) (string, error) {
 	tok, err := c.read()
 	if err == nil && time.Until(tok.ExpiresAt) > time.Minute && tok.AccessToken != "" {
