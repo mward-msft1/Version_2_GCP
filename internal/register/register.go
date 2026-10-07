@@ -387,9 +387,15 @@ func requiredAccess(ctx context.Context, token string) (map[string]any, []string
 	for _, name := range want {
 		found := false
 		for _, scope := range sp.Value[0].Scopes {
-			if strings.EqualFold(scope.Value, name) && strings.EqualFold(scope.Type, "User") {
+			if !strings.EqualFold(scope.Value, name) {
+				continue
+			}
+			// Purview records these delegated scopes as Admin on the Graph
+			// service principal, but they are granted on oauth2PermissionGrants.
+			if strings.EqualFold(scope.Type, "User") || isDelegatedPurviewScope(name) {
 				scopes = append(scopes, map[string]any{"id": scope.ID, "type": "Scope"})
 				found = true
+				break
 			}
 		}
 		if !found {
@@ -403,6 +409,15 @@ func requiredAccess(ctx context.Context, token string) (map[string]any, []string
 		"resourceAppId":  config.GraphAppID,
 		"resourceAccess": scopes,
 	}, missing, nil
+}
+
+func isDelegatedPurviewScope(name string) bool {
+	switch strings.ToLower(name) {
+	case "content.process.user", "contentactivity.write", "protectionscopes.compute.user":
+		return true
+	default:
+		return false
+	}
 }
 
 func writeGenerated(cfg config.Config, result Result) error {
@@ -627,7 +642,7 @@ func registerAgent365(ctx context.Context, token, sponsorID string, result *Resu
 		var existing map[string]any
 		err := graphInto(ctx, token, http.MethodGet, "https://graph.microsoft.com/beta/copilot/agentRegistrations/"+url.PathEscape(result.AgentRegistrationID), nil, &existing)
 		if err == nil && str(existing, "id") != "" {
-			return nil
+			return publishAgentCard(ctx, token, result.AgentRegistrationID, cfg)
 		}
 		result.AgentRegistrationID = ""
 	}
@@ -638,7 +653,7 @@ func registerAgent365(ctx context.Context, token, sponsorID string, result *Resu
 		"createdBy":                  sponsorID,
 		"ownerIds":                   []string{sponsorID},
 		"sourceAgentId":              cfg.AgentID,
-		"originatingStore":           "Caldova",
+		"originatingStore":           "Google Vertex",
 		"agentIdentityBlueprintId":   result.BlueprintAppID,
 		"agentIdentityId":            result.AgentIdentityID,
 		"sourceCreatedDateTime":      now,
@@ -648,6 +663,166 @@ func registerAgent365(ctx context.Context, token, sponsorID string, result *Resu
 		return fmt.Errorf("Agent 365 registry entry was not created: %w", err)
 	}
 	result.AgentRegistrationID = str(registration, "id")
+	if err := publishAgentCard(ctx, token, result.AgentRegistrationID, cfg); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Sync republishes the Agent 365 card and repairs the blueprint Purview consent
+// without creating another blueprint or identity.
+func Sync(ctx context.Context, cfg config.Config) error {
+	if cfg.ClientID == "" || cfg.AgentIdentityID == "" {
+		return fmt.Errorf("generated registration is incomplete; run register before sync")
+	}
+	path, err := cfg.TokenPath()
+	if err != nil {
+		return err
+	}
+	token, err := (&auth.Client{
+		TenantID: cfg.TenantID,
+		ClientID: config.BootstrapClientID,
+		Scopes:   registerScopes,
+		CacheKey: "register-caldova",
+		Path:     path,
+	}).Token(ctx)
+	if err != nil {
+		return err
+	}
+	if _, err := requireCaldovaToken(token); err != nil {
+		return err
+	}
+	blueprintID, err := applicationObjectID(ctx, token, cfg.ClientID)
+	if err != nil || blueprintID == "" {
+		blueprintID = cfg.ClientID
+	}
+	access, missing, err := requiredAccess(ctx, token)
+	if err != nil {
+		return err
+	}
+	for _, name := range missing {
+		if name == "ContentActivity.Write" || name == "ProtectionScopes.Compute.User" {
+			return fmt.Errorf("Graph has not published %s in Caldova, so the blueprint grant cannot include it", name)
+		}
+	}
+	if err := configureBlueprint(ctx, token, blueprintID, cfg, access); err != nil {
+		return err
+	}
+	principalID, err := graphGetID(ctx, token, "https://graph.microsoft.com/v1.0/servicePrincipals(appId='"+cfg.ClientID+"')?$select=id")
+	if err != nil {
+		return fmt.Errorf("blueprint principal was not found: %w", err)
+	}
+	if err := grantAdminConsent(ctx, token, principalID); err != nil {
+		return fmt.Errorf("blueprint consent was not updated: %w", err)
+	}
+	if err := publishAgentCard(ctx, token, cfg.AgentID, cfg); err != nil {
+		return err
+	}
+	return verifySync(ctx, token, cfg)
+}
+
+func publishAgentCard(ctx context.Context, token, registrationID string, cfg config.Config) error {
+	if registrationID == "" {
+		registrationID = cfg.AgentID
+	}
+	endpoint := "https://graph.microsoft.com/beta/copilot/agentRegistrations/" + url.PathEscape(registrationID)
+	_, err := graphJSON(ctx, token, http.MethodPatch, endpoint, map[string]any{
+		"agentCard":                  agentCard(cfg),
+		"sourceLastModifiedDateTime": time.Now().UTC().Format(time.RFC3339),
+	})
+	if err != nil {
+		return fmt.Errorf("agent card was not published: %w", err)
+	}
+	return nil
+}
+
+func agentCard(cfg config.Config) map[string]any {
+	return map[string]any{
+		"protocolVersion":    "0.3.0",
+		"name":               cfg.AgentName,
+		"displayName":        cfg.AgentName,
+		"description":        cfg.Description,
+		"originatingStore":   "Google Vertex",
+		"provider": map[string]any{
+			"organization": "Google Vertex",
+			"url":          "https://cloud.google.com/vertex-ai",
+		},
+		"version":            "2.0.0",
+		"documentationUrl":   "https://github.com/mward-msft1/Version_2_GCP",
+		"defaultInputModes":  []string{"text/plain", "application/json"},
+		"defaultOutputModes": []string{"text/plain", "application/json"},
+		"capabilities": map[string]any{
+			"streaming":         true,
+			"pushNotifications": false,
+		},
+		"skills": []map[string]any{
+			skill("run_dlp_test", "Run DLP test", "Runs the DocSite DLP scenario for CharlotteW or BrookeG. Uses WorkIQ for mail and Teams, Graph when WorkIQ denies a path, and Purview before every outbound action.", []string{"dlp", "purview", "workiq", "graph"}, []string{"Run the DLP test for CharlotteW using USSocialSecurityNumbers--(x10)Pos.docx"}),
+			skill("workiq_send_mail", "Send mail through WorkIQ", "Sends the test document to an approved internal recipient and to mward042@gmail.com through the WorkIQ sendMail action. Falls back to Microsoft Graph only when WorkIQ cannot send.", []string{"workiq", "mail"}, []string{"Send the DocSite file to the approved internal and external recipients"}),
+			skill("workiq_post_teams_chat", "Post the file in a Teams chat", "Posts the test document in the approved Teams chat through WorkIQ. Falls back to Microsoft Graph chat messages when WorkIQ is unavailable.", []string{"workiq", "teams", "chat"}, []string{"Post the DocSite file in the Teams chat"}),
+			skill("workiq_post_teams_channel", "Post the file in a Teams channel", "Posts the test document in the approved Teams channel through WorkIQ. Falls back to Microsoft Graph channel messages when WorkIQ is unavailable.", []string{"workiq", "teams", "channel"}, []string{"Post the DocSite file in the Teams channel"}),
+			skill("list_docsite_documents", "List DocSite documents", "Lists documents in the DocSite library. WorkIQ site listing is policy-denied, so this function uses the Microsoft Graph fallback.", []string{"graph", "sharepoint"}, []string{"List the sensitive test documents in DocSite"}),
+			skill("download_docsite_file", "Download a DocSite file", "Downloads the selected DocSite file. Uses WorkIQ when the item path is allowed and Microsoft Graph when it is not.", []string{"graph", "workiq", "sharepoint"}, []string{"Download USSocialSecurityNumbers--(x10)Pos.docx"}),
+			skill("purview_record_prompt", "Record the user prompt", "Sends the user prompt to Purview as an uploadText interaction and records the matching content activity.", []string{"purview", "prompt"}, []string{"Record this prompt in Purview"}),
+			skill("purview_record_response", "Record the agent response", "Sends the agent response to Purview as a downloadText interaction and records the matching content activity.", []string{"purview", "response"}, []string{"Record this response in Purview"}),
+			skill("purview_evaluate_content", "Evaluate sensitive content", "Submits message text and file bytes to Purview processContent before mail or Teams actions. A block skips the outbound action.", []string{"purview", "dlp"}, []string{"Check the DocSite file against Purview before sending it"}),
+		},
+	}
+}
+
+func skill(id, name, description string, tags, examples []string) map[string]any {
+	return map[string]any{
+		"id":          id,
+		"name":        name,
+		"displayName": name,
+		"description": description,
+		"tags":        tags,
+		"examples":    examples,
+		"inputModes":  []string{"text/plain", "application/json"},
+		"outputModes": []string{"text/plain", "application/json"},
+	}
+}
+
+func verifySync(ctx context.Context, token string, cfg config.Config) error {
+	registration, err := graphJSON(ctx, token, http.MethodGet, "https://graph.microsoft.com/beta/copilot/agentRegistrations/"+url.PathEscape(cfg.AgentID), nil)
+	if err != nil {
+		return err
+	}
+	card, _ := registration["agentCard"].(map[string]any)
+	if cardStore := str(card, "originatingStore"); cardStore != "Google Vertex" {
+		return fmt.Errorf("agent card store is %q, expected Google Vertex", cardStore)
+	}
+	skills, _ := card["skills"].([]any)
+	if len(skills) == 0 {
+		return fmt.Errorf("agent card was saved without skills")
+	}
+	fmt.Printf("Agent card skills: %d\n", len(skills))
+	for _, item := range skills {
+		skill, _ := item.(map[string]any)
+		fmt.Printf("  - %s\n", str(skill, "id"))
+	}
+	principalID, err := graphGetID(ctx, token, "https://graph.microsoft.com/v1.0/servicePrincipals(appId='"+cfg.ClientID+"')?$select=id")
+	if err != nil {
+		return err
+	}
+	var grants struct {
+		Value []struct {
+			ClientID string `json:"clientId"`
+			Scope    string `json:"scope"`
+		} `json:"value"`
+	}
+	if err := graphInto(ctx, token, http.MethodGet, "https://graph.microsoft.com/v1.0/oauth2PermissionGrants?$filter="+url.QueryEscape("clientId eq '"+principalID+"'"), nil, &grants); err != nil {
+		return err
+	}
+	if len(grants.Value) == 0 {
+		return fmt.Errorf("blueprint principal has no consent grant")
+	}
+	scope := grants.Value[0].Scope
+	for _, required := range []string{"Content.Process.User", "ContentActivity.Write", "ProtectionScopes.Compute.User"} {
+		if !strings.Contains(scope, required) {
+			return fmt.Errorf("blueprint consent is still missing %s", required)
+		}
+	}
+	fmt.Println("Blueprint consent includes Content.Process.User, ContentActivity.Write, and ProtectionScopes.Compute.User.")
 	return nil
 }
 

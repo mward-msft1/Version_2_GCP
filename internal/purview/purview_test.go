@@ -34,7 +34,22 @@ func TestPayloadPairsPromptAndResponse(t *testing.T) {
 		t.Fatal("prompt and response must share a correlation id")
 	}
 	if _, ok := responseEntry["content"]; ok {
-		t.Fatal("contentActivities payload must not include content text")
+		t.Fatal("metadata-only payload must not include content text")
+	}
+	activity := c.activityPayload("downloadText", "corr", 2)
+	if _, ok := activity["contentToProcess"]; ok {
+		t.Fatal("contentActivities must not use the processContent wrapper")
+	}
+	meta, ok := activity["contentMetadata"].(map[string]any)
+	if !ok {
+		t.Fatal("contentActivities requires contentMetadata")
+	}
+	activityEntry := meta["contentEntries"].([]any)[0].(map[string]any)
+	if _, ok := activityEntry["content"]; ok {
+		t.Fatal("contentActivities must not include prompt or response text")
+	}
+	if activityEntry["correlationId"] != promptEntry["correlationId"] {
+		t.Fatal("activity must keep the prompt correlation id")
 	}
 	if prompt["contentToProcess"].(map[string]any)["activityMetadata"].(map[string]any)["activity"] != "uploadText" {
 		t.Fatal("prompt activity")

@@ -1,0 +1,233 @@
+"""Export one agent run with the Microsoft OpenTelemetry Distro.
+
+The Agent 365 distro has no Go package. The Go agent acquires the app-only
+token and invokes this script so spans are created and exported by
+microsoft-opentelemetry.
+"""
+
+import json
+import logging
+import os
+import sys
+
+os.environ["ENABLE_OBSERVABILITY"] = "true"
+os.environ["ENABLE_A365_OBSERVABILITY_EXPORTER"] = "true"
+os.environ["A365_USE_S2S_ENDPOINT"] = "true"
+
+
+def main() -> int:
+    try:
+        payload = json.load(sys.stdin)
+    except json.JSONDecodeError as exc:
+        return fail(f"distro exporter received invalid input: {exc}")
+    token = os.environ.get("A365_OBSERVABILITY_TOKEN", "").strip()
+    if not token:
+        return fail("observability token was not provided to the distro exporter")
+    evidence = Evidence()
+    try:
+        export(payload, token, evidence)
+    except Exception as exc:  # noqa: BLE001 - report exporter failures to the Go caller
+        return fail(f"microsoft-opentelemetry export failed: {exc}")
+    steps = payload.get("steps") or []
+    status, summary = evidence.result(2 + len(steps))
+    emit({"status": status, "spanCount": 2 + len(steps), "summary": summary})
+    return 0 if 200 <= status < 300 else 1
+
+
+class _EvidenceHandler(logging.Handler):
+    def __init__(self, evidence: "Evidence") -> None:
+        super().__init__(level=logging.DEBUG)
+        self._evidence = evidence
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self._evidence.lines.append(record.getMessage())
+
+
+class Evidence:
+    def __init__(self) -> None:
+        self.lines: list[str] = []
+
+    def result(self, span_count: int) -> tuple[int, str]:
+        delivered = [line for line in self.lines if "HTTP 2" in line and "success" in line]
+        failed = [line for line in self.lines if "non-retryable error" in line or "Token resolution failed" in line]
+        relevant_failed = [line for line in failed if "Tenant id  is invalid" not in line]
+        if delivered and not relevant_failed:
+            return 200, f"microsoft-opentelemetry exported {span_count} spans. {delivered[-1]}"
+        if relevant_failed:
+            return 0, relevant_failed[-1]
+        if delivered:
+            return 200, f"microsoft-opentelemetry exported {span_count} spans. {delivered[-1]}"
+        return 0, "microsoft-opentelemetry finished without an Agent 365 delivery confirmation"
+
+
+def export(payload: dict, token: str, evidence: Evidence) -> None:
+    from opentelemetry import trace
+    from microsoft.opentelemetry import use_microsoft_opentelemetry
+    from microsoft.opentelemetry.a365.core import (
+        AgentDetails,
+        BaggageBuilder,
+        CallerDetails,
+        Channel,
+        ChatMessage,
+        ExecuteToolScope,
+        InferenceCallDetails,
+        InferenceOperationType,
+        InferenceScope,
+        InputMessages,
+        InvokeAgentScope,
+        InvokeAgentScopeDetails,
+        MessageRole,
+        OutputMessage,
+        OutputMessages,
+        Request,
+        ServiceEndpoint,
+        TextPart,
+        ToolCallDetails,
+        ToolType,
+        UserDetails,
+    )
+
+    agent_id = required(payload, "agentId")
+    tenant_id = required(payload, "tenantId")
+    os.environ["A365_TENANT_ID"] = tenant_id
+    os.environ["A365_AGENT_ID"] = agent_id
+    os.environ["CONNECTIONS__SERVICE_CONNECTION__SETTINGS__TENANTID"] = tenant_id
+    logging.basicConfig(level=logging.DEBUG, stream=sys.stderr)
+    logging.getLogger("microsoft.opentelemetry").setLevel(logging.DEBUG)
+    logging.getLogger("microsoft.opentelemetry").addHandler(_EvidenceHandler(evidence))
+    use_microsoft_opentelemetry(
+        enable_a365=True,
+        a365_enable_observability_exporter=True,
+        a365_use_s2s_endpoint=True,
+        a365_token_resolver=lambda _agent_id, _tenant_id: token,
+        a365_max_queue_size=2048,
+        a365_scheduled_delay_ms=5000,
+        a365_exporter_timeout_ms=30000,
+        a365_max_export_batch_size=512,
+    )
+
+    acting_user = str(payload.get("actingUser") or "")
+    user = UserDetails(
+        user_id=str(payload.get("userId") or "unknown"),
+        user_email=acting_user,
+        user_name=acting_user.split("@", 1)[0] or acting_user or "unknown",
+    )
+    agent = AgentDetails(
+        agent_id=agent_id,
+        agent_name=str(payload.get("agentName") or "Caldova GCP Agent Version 2"),
+        agent_description=str(payload.get("description") or ""),
+        agent_blueprint_id=str(payload.get("blueprintId") or ""),
+        tenant_id=tenant_id,
+        provider_name="google",
+    )
+    conversation = str(payload.get("conversationId") or "caldova")
+    prompt = str(payload.get("input") or "")
+    output = str(payload.get("output") or "")
+    endpoint = ServiceEndpoint(hostname="us-central1-aiplatform.googleapis.com", port=443)
+    request = Request(
+        content=InputMessages(messages=[
+            ChatMessage(role=MessageRole.USER, parts=[TextPart(content=prompt)]),
+        ]),
+        session_id=conversation,
+        channel=Channel(name="msteams"),
+        conversation_id=conversation,
+    )
+    baggage = (
+        BaggageBuilder()
+        .tenant_id(tenant_id)
+        .agent_id(agent_id)
+        .agent_name(agent.agent_name)
+        .agent_description(agent.agent_description)
+        .agent_blueprint_id(agent.agent_blueprint_id)
+        .user_id(user.user_id)
+        .user_email(user.user_email)
+        .user_name(user.user_name)
+        .user_client_ip("127.0.0.1")
+        .channel_name("msteams")
+        .session_id(conversation)
+        .conversation_id(conversation)
+        .invoke_agent_server(endpoint.hostname, endpoint.port)
+    )
+    with baggage.build():
+        with InvokeAgentScope.start(
+            request=request,
+            scope_details=InvokeAgentScopeDetails(endpoint=endpoint),
+            agent_details=agent,
+            caller_details=CallerDetails(user_details=user),
+        ) as invoke_scope:
+            invoke_scope.record_input_messages(InputMessages(messages=[
+                ChatMessage(role=MessageRole.USER, parts=[TextPart(content=prompt)]),
+            ]))
+            with InferenceScope.start(
+                request=request,
+                details=InferenceCallDetails(
+                    operationName=InferenceOperationType.CHAT,
+                    model="gemini-flash-latest",
+                    providerName="google",
+                    endpoint=endpoint,
+                ),
+                agent_details=agent,
+                user_details=user,
+            ) as inference_scope:
+                inference_scope.record_output_messages(OutputMessages(messages=[
+                    OutputMessage(
+                        role=MessageRole.ASSISTANT,
+                        parts=[TextPart(content=output)],
+                        finish_reason="stop",
+                    ),
+                ]))
+            for index, step in enumerate(payload.get("steps") or [], start=1):
+                name = str(step.get("name") or "tool")
+                detail = str(step.get("detail") or "")
+                with ExecuteToolScope.start(
+                    request=request,
+                    details=ToolCallDetails(
+                        tool_name=name,
+                        arguments=prompt[:2000],
+                        tool_call_id=f"call-{index:02d}",
+                        description=name,
+                        tool_type=ToolType.FUNCTION.value,
+                        endpoint=endpoint,
+                    ),
+                    agent_details=agent,
+                    user_details=user,
+                ) as tool_scope:
+                    tool_scope.record_response(detail)
+                    if not step.get("ok", True):
+                        tool_scope.record_error(RuntimeError(detail or name))
+            invoke_scope.record_output_messages(OutputMessages(messages=[
+                OutputMessage(
+                    role=MessageRole.ASSISTANT,
+                    parts=[TextPart(content=output)],
+                    finish_reason="stop",
+                ),
+            ]))
+
+    provider = trace.get_tracer_provider()
+    flush = getattr(provider, "force_flush", None)
+    if callable(flush) and flush(timeout_millis=30000) is False:
+        raise RuntimeError("microsoft-opentelemetry flush failed")
+    shutdown = getattr(provider, "shutdown", None)
+    if callable(shutdown):
+        shutdown()
+
+
+def required(payload: dict, key: str) -> str:
+    value = str(payload.get(key) or "").strip()
+    if not value:
+        raise RuntimeError(f"distro exporter requires {key}")
+    return value
+
+
+def fail(message: str) -> int:
+    emit({"status": 0, "spanCount": 0, "summary": message})
+    return 1
+
+
+def emit(result: dict) -> None:
+    json.dump(result, sys.stdout)
+    sys.stdout.write("\n")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

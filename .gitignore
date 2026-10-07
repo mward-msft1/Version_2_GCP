@@ -8,3 +8,5 @@ bin/
 service-account*.json
 token.json
 tokens.json
+__pycache__/
+*.pyc

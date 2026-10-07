@@ -1,14 +1,17 @@
 package m365
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 )
 
@@ -64,12 +67,66 @@ func (c *Client) Me(ctx context.Context) (string, string, error) {
 }
 
 func (c *Client) ListDocuments(ctx context.Context, host, sitePath string) (string, []DriveItem, error) {
+	driveID, err := c.documentsDrive(ctx, host, sitePath)
+	if err != nil {
+		return "", nil, err
+	}
+	var files []DriveItem
+	listURL := fmt.Sprintf("https://graph.microsoft.com/v1.0/drives/%s/root/children?$select=id,name,size,webUrl,folder,file&$top=200", url.PathEscape(driveID))
+	for listURL != "" && len(files) < 1000 {
+		var page struct {
+			Value []DriveItem `json:"value"`
+			Next  string      `json:"@odata.nextLink"`
+		}
+		if err := c.get(ctx, listURL, &page); err != nil {
+			return "", nil, err
+		}
+		for _, item := range page.Value {
+			if item.File != nil {
+				files = append(files, item)
+			}
+		}
+		listURL = page.Next
+	}
+	return driveID, files, nil
+}
+
+// FindDocument searches the DocSite library for an exact file name. The root
+// children page can omit later files, so a named test document must not fall
+// back to the first listed file.
+func (c *Client) FindDocument(ctx context.Context, host, sitePath, name string) (string, DriveItem, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "", DriveItem{}, fmt.Errorf("document name is required")
+	}
+	driveID, err := c.documentsDrive(ctx, host, sitePath)
+	if err != nil {
+		return "", DriveItem{}, err
+	}
+	query := strings.ReplaceAll(name, "'", "''")
+	encoded := strings.ReplaceAll(url.QueryEscape(query), "+", "%20")
+	searchURL := fmt.Sprintf("https://graph.microsoft.com/v1.0/drives/%s/root/search(q='%s')?$select=id,name,size,webUrl,file,folder", url.PathEscape(driveID), encoded)
+	var items struct {
+		Value []DriveItem `json:"value"`
+	}
+	if err := c.get(ctx, searchURL, &items); err != nil {
+		return "", DriveItem{}, err
+	}
+	for _, item := range items.Value {
+		if item.File != nil && strings.EqualFold(item.Name, name) {
+			return driveID, item, nil
+		}
+	}
+	return "", DriveItem{}, fmt.Errorf("document %s was not found in %s%s", name, host, sitePath)
+}
+
+func (c *Client) documentsDrive(ctx context.Context, host, sitePath string) (string, error) {
 	var site struct {
 		ID string `json:"id"`
 	}
 	siteURL := fmt.Sprintf("https://graph.microsoft.com/v1.0/sites/%s:%s", host, sitePath)
 	if err := c.get(ctx, siteURL, &site); err != nil {
-		return "", nil, err
+		return "", err
 	}
 	var drives struct {
 		Value []struct {
@@ -78,35 +135,17 @@ func (c *Client) ListDocuments(ctx context.Context, host, sitePath string) (stri
 		} `json:"value"`
 	}
 	if err := c.get(ctx, "https://graph.microsoft.com/v1.0/sites/"+url.PathEscape(site.ID)+"/drives?$select=id,name", &drives); err != nil {
-		return "", nil, err
+		return "", err
 	}
-	driveID := ""
 	for _, drive := range drives.Value {
 		if strings.EqualFold(drive.Name, "Documents") {
-			driveID = drive.ID
-			break
+			return drive.ID, nil
 		}
 	}
-	if driveID == "" && len(drives.Value) > 0 {
-		driveID = drives.Value[0].ID
+	if len(drives.Value) > 0 {
+		return drives.Value[0].ID, nil
 	}
-	if driveID == "" {
-		return "", nil, fmt.Errorf("no document library found at %s%s", host, sitePath)
-	}
-	var items struct {
-		Value []DriveItem `json:"value"`
-	}
-	listURL := fmt.Sprintf("https://graph.microsoft.com/v1.0/drives/%s/root/children?$select=id,name,size,webUrl,folder,file", url.PathEscape(driveID))
-	if err := c.get(ctx, listURL, &items); err != nil {
-		return "", nil, err
-	}
-	var files []DriveItem
-	for _, item := range items.Value {
-		if item.File != nil {
-			files = append(files, item)
-		}
-	}
-	return driveID, files, nil
+	return "", fmt.Errorf("no document library found at %s%s", host, sitePath)
 }
 
 func (c *Client) PrepareFile(ctx context.Context, driveID string, item DriveItem) (FilePayload, error) {
@@ -117,9 +156,7 @@ func (c *Client) PrepareFile(ctx context.Context, driveID string, item DriveItem
 			return payload, err
 		}
 		payload.Bytes = raw
-		if isText(item) {
-			payload.Snippet = item.Name + "\n" + string(raw)
-		}
+		payload.Snippet = ContentSnippet(item, raw)
 	}
 	var link struct {
 		Link struct {
@@ -257,6 +294,57 @@ func isText(item DriveItem) bool {
 	}
 	mime := strings.ToLower(item.File.MimeType)
 	return strings.HasPrefix(mime, "text/") || strings.Contains(mime, "json") || strings.Contains(mime, "csv")
+}
+
+var wordText = regexp.MustCompile(`(?s)<w:t[^>]*>(.*?)</w:t>`)
+
+// ContentSnippet returns text Purview can evaluate. Word documents are unzipped
+// so published DLP policies see the document text, not only the file name.
+func ContentSnippet(item DriveItem, raw []byte) string {
+	if isText(item) {
+		return item.Name + "\n" + string(raw)
+	}
+	if text := docxText(item.Name, raw); text != "" {
+		return item.Name + "\n" + text
+	}
+	return item.Name
+}
+
+func docxText(name string, raw []byte) string {
+	if !strings.HasSuffix(strings.ToLower(name), ".docx") || len(raw) == 0 {
+		return ""
+	}
+	zr, err := zip.NewReader(bytes.NewReader(raw), int64(len(raw)))
+	if err != nil {
+		return ""
+	}
+	for _, file := range zr.File {
+		if file.Name != "word/document.xml" {
+			continue
+		}
+		rc, err := file.Open()
+		if err != nil {
+			return ""
+		}
+		body, err := io.ReadAll(io.LimitReader(rc, 1<<20))
+		rc.Close()
+		if err != nil {
+			return ""
+		}
+		parts := wordText.FindAllSubmatch(body, -1)
+		var b strings.Builder
+		for _, part := range parts {
+			if b.Len() > 0 {
+				b.WriteByte(' ')
+			}
+			b.WriteString(html.UnescapeString(string(part[1])))
+			if b.Len() > 12000 {
+				break
+			}
+		}
+		return strings.TrimSpace(b.String())
+	}
+	return ""
 }
 
 func (c *Client) get(ctx context.Context, endpoint string, out any) error {
