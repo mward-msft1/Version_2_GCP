@@ -647,6 +647,8 @@ func registerAgent365(ctx context.Context, token, sponsorID string, result *Resu
 		result.AgentRegistrationID = ""
 	}
 	now := time.Now().UTC().Format(time.RFC3339)
+	// Agent identity blueprints are Graph v1.0. Agent 365 registration remains
+	// the published beta copilot/agentRegistrations API; there is no v1.0 route.
 	registration, err := graphJSON(ctx, token, http.MethodPost, "https://graph.microsoft.com/beta/copilot/agentRegistrations", map[string]any{
 		"displayName":                cfg.AgentName,
 		"description":                cfg.Description,

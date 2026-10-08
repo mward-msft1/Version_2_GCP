@@ -18,7 +18,7 @@ When prompted, you need to try and send a file to an approved internal and exter
 - Prompt and response text is captured only when the Know Your Data collection policy has ingestion enabled for `UploadText` and `DownloadText`.
 - Passwords are never stored. Sign-in is device code only. Tokens stay in the user config directory, outside this repo.
 
-There is no Agent 365 Go SDK. Registration uses the same Microsoft Graph agent-identity APIs the A365 CLI and SDK use: agent identity blueprint, blueprint principal, and agent identity. Vertex agents then appear in Agent 365 through Connected platforms sync.
+There is no Agent 365 Go SDK. Registration uses the Graph v1.0 agent-identity APIs the A365 CLI uses: agent identity blueprint, blueprint principal, and agent identity. Agent 365 card registration remains the published `beta/copilot/agentRegistrations` API. Telemetry uses the Microsoft OpenTelemetry Distro `microsoft-opentelemetry` 1.4.0. The Python Agent 365 SDK packages are pinned at 1.0.0, the newest stable release. Purview `processContent` and `protectionScopes/compute` use Graph v1.0. Vertex deploy uses the Agent Engine v1 API. Python packages are `google-cloud-aiplatform` 2.3.0 and `google-adk` 2.10.0. Go libraries are ADK v2.5.0, genai v1.73.0, and `google.golang.org/api` v0.301.0.
 
 ## Run
 

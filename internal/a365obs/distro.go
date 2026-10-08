@@ -114,6 +114,28 @@ func parseDistroResult(out []byte, spanCount int) Result {
 	return result
 }
 
+// VerifyPlatform imports google-adk, google-cloud-aiplatform, and the Agent 365 SDK.
+func VerifyPlatform(ctx context.Context) (string, error) {
+	script, err := distroScript()
+	if err != nil {
+		return "", err
+	}
+	python, pythonArgs, err := pythonCommand(ctx)
+	if err != nil {
+		return "", err
+	}
+	cmd := exec.CommandContext(ctx, python, append(pythonArgs, script, "--versions")...)
+	out, err := cmd.CombinedOutput()
+	text := strings.TrimSpace(string(out))
+	if err != nil {
+		if text == "" {
+			text = err.Error()
+		}
+		return "", fmt.Errorf("platform version check failed: %s", truncate(text, 500))
+	}
+	return text, nil
+}
+
 func distroScript() (string, error) {
 	candidates := []string{
 		os.Getenv("A365_DISTRO_SCRIPT"),

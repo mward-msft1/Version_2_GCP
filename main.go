@@ -439,6 +439,18 @@ func promptPairs(acting, fileName, snippet string) [][2]string {
 			"Who is allowed to start this DLP test, and which site holds the test files? Acting user: " + acting,
 			"CharlotteW and BrookeG can start the test. The files are in the DocSite document library. External delivery is limited to mward042@gmail.com.",
 		},
+		{
+			"If Purview blocks " + fileName + ", should you still email it or post it in Teams? Acting user: " + acting,
+			"No. A Purview block is a successful DLP test. I will report the block and will not email or post " + fileName + ".",
+		},
+		{
+			"Which channel and chat should receive " + fileName + "? Acting user: " + acting,
+			"Post it in the one-to-one Teams chat with " + other + " and in the first joined team channel. Include the organization link, not a new copy outside those targets.",
+		},
+		{
+			"Record this interaction for Agent 365 and Purview after reviewing " + fileName + ". Acting user: " + acting,
+			"I recorded the prompt as uploadText and this response as downloadText for " + acting + ". Agent 365 receives the same turn through the OpenTelemetry distro.",
+		},
 	}
 }
 
@@ -473,6 +485,11 @@ func validate(cfg config.Config) error {
 		fmt.Println("workiq:", cfg.WorkIQMCPURL)
 		fmt.Println("workiq tools: fetch, fetch_blob, do_action, create_entity")
 	}
+	platform, err := a365obs.VerifyPlatform(context.Background())
+	if err != nil {
+		return err
+	}
+	fmt.Println(platform)
 	fmt.Println("local validation passed. Agent 365 objects are checked above from the Caldova admin token. Vertex deploy still needs gcloud signed in as the GCP account. This process will not use the corporate Azure CLI session and will not accept a pasted password.")
 	return nil
 }

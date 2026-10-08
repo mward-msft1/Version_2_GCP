@@ -16,6 +16,12 @@ os.environ["A365_USE_S2S_ENDPOINT"] = "true"
 
 
 def main() -> int:
+    if "--versions" in sys.argv:
+        try:
+            emit({"status": 200, "summary": "platform versions", "platform": require_platform()})
+        except Exception as exc:  # noqa: BLE001 - report version failures to the Go caller
+            return fail(f"platform version check failed: {exc}")
+        return 0
     try:
         payload = json.load(sys.stdin)
     except json.JSONDecodeError as exc:
@@ -60,7 +66,48 @@ class Evidence:
         return 0, "microsoft-opentelemetry finished without an Agent 365 delivery confirmation"
 
 
+def require_platform() -> dict:
+    import importlib.metadata as metadata
+
+    from packaging.version import Version
+
+    import google.adk
+    import google.cloud.aiplatform as aiplatform
+    import microsoft_agents_a365.notifications
+    import microsoft_agents_a365.observability.core
+    import microsoft_agents_a365.tooling
+    from google.cloud import aiplatform_v1
+    from microsoft_agents_a365.runtime import get_observability_authentication_scope
+
+    required = {
+        "google-adk": "1.18.0",
+        "google-cloud-aiplatform": "1.126.1",
+        "microsoft-agents-a365-runtime": "1.0.0",
+        "microsoft-agents-a365-observability-core": "1.0.0",
+        "microsoft-agents-a365-notifications": "1.0.0",
+        "microsoft-agents-a365-tooling": "1.0.0",
+        "microsoft-opentelemetry": "1.4.0",
+    }
+    found = {}
+    for name, floor in required.items():
+        current = metadata.version(name)
+        if Version(current) < Version(floor):
+            raise RuntimeError(f"{name} {current} is below required {floor}")
+        found[name] = current
+    # Touch the libraries so a metadata-only install cannot pass.
+    if not google.adk.__version__ or not aiplatform.__version__:
+        raise RuntimeError("google-adk or google-cloud-aiplatform did not load")
+    if aiplatform_v1.ReasoningEngineServiceClient is None:
+        raise RuntimeError("Vertex Reasoning Engine v1 client is missing")
+    scope = get_observability_authentication_scope()
+    if not scope:
+        raise RuntimeError("Agent 365 SDK did not return an observability scope")
+    found["a365ObservabilityScope"] = scope[0]
+    return found
+
+
 def export(payload: dict, token: str, evidence: Evidence) -> None:
+    require_platform()
     from opentelemetry import trace
     from microsoft.opentelemetry import use_microsoft_opentelemetry
     from microsoft.opentelemetry.a365.core import (
@@ -92,9 +139,6 @@ def export(payload: dict, token: str, evidence: Evidence) -> None:
     os.environ["A365_TENANT_ID"] = tenant_id
     os.environ["A365_AGENT_ID"] = agent_id
     os.environ["CONNECTIONS__SERVICE_CONNECTION__SETTINGS__TENANTID"] = tenant_id
-    logging.basicConfig(level=logging.DEBUG, stream=sys.stderr)
-    logging.getLogger("microsoft.opentelemetry").setLevel(logging.DEBUG)
-    logging.getLogger("microsoft.opentelemetry").addHandler(_EvidenceHandler(evidence))
     use_microsoft_opentelemetry(
         enable_a365=True,
         a365_enable_observability_exporter=True,
@@ -105,6 +149,9 @@ def export(payload: dict, token: str, evidence: Evidence) -> None:
         a365_exporter_timeout_ms=30000,
         a365_max_export_batch_size=512,
     )
+    exporter_log = logging.getLogger("microsoft.opentelemetry.a365.core.exporters.agent365_exporter")
+    exporter_log.setLevel(logging.DEBUG)
+    exporter_log.addHandler(_EvidenceHandler(evidence))
 
     acting_user = str(payload.get("actingUser") or "")
     user = UserDetails(
@@ -203,13 +250,31 @@ def export(payload: dict, token: str, evidence: Evidence) -> None:
                 ),
             ]))
 
+    # The distro registers a baggage processor before the exporter. That
+    # processor does not implement force_flush, so the provider flush returns
+    # false and never reaches the Agent 365 batch processor.
+    flush_agent365_exporter()
     provider = trace.get_tracer_provider()
-    flush = getattr(provider, "force_flush", None)
-    if callable(flush) and flush(timeout_millis=30000) is False:
-        raise RuntimeError("microsoft-opentelemetry flush failed")
     shutdown = getattr(provider, "shutdown", None)
     if callable(shutdown):
         shutdown()
+
+
+def flush_agent365_exporter(timeout_millis: int = 60000) -> None:
+    from opentelemetry import trace
+
+    provider = trace.get_tracer_provider()
+    multi = getattr(provider, "_active_span_processor", None)
+    processors = list(getattr(multi, "_span_processors", []) or [])
+    flushed = 0
+    for processor in processors:
+        if getattr(processor, "span_exporter", None) is None:
+            continue
+        if processor.force_flush(timeout_millis) is False:
+            raise RuntimeError("Agent 365 batch processor flush failed")
+        flushed += 1
+    if flushed == 0:
+        raise RuntimeError("Agent 365 batch processor was not registered")
 
 
 def required(payload: dict, key: str) -> str:
