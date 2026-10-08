@@ -69,7 +69,7 @@ ENV ENABLE_OBSERVABILITY=true
 ENV ENABLE_A365_OBSERVABILITY_EXPORTER=true
 ENV A365_USE_S2S_ENDPOINT=true
 EXPOSE 8080
-CMD ["/app/caldova-gcp-agent", "web", "-port", "8080", "agentengine"]
+CMD ["/app/caldova-gcp-agent", "web", "-host", "0.0.0.0", "-port", "8080", "agentengine"]
 '@ | Set-Content -Encoding ascii (Join-Path $stage "Dockerfile")
 
     $archive = Join-Path ([System.IO.Path]::GetTempPath()) "caldova-vertex-archive.tgz"
