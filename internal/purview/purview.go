@@ -231,7 +231,8 @@ func (c *Client) agents() []any {
 }
 
 func (c *Client) endpoint(action string) string {
-	return c.versionedEndpoint("beta", action)
+	// processContent and protectionScopes/compute are Graph v1.0.
+	return c.versionedEndpoint("v1.0", action)
 }
 
 func (c *Client) versionedEndpoint(version, action string) string {

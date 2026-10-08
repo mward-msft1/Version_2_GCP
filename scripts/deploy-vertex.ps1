@@ -58,7 +58,9 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "-s -w" -o caldova-g
 FROM python:3.12-slim-bookworm
 WORKDIR /app
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# google-adk 2.10.0 meets the >=1.18.0 floor. Install it without deps so it
+# does not downgrade the distro's opentelemetry-sdk 1.45 pin.
+RUN pip install --no-cache-dir -r requirements.txt && pip install --no-cache-dir --no-deps google-adk==2.10.0
 COPY --from=builder /app/caldova-gcp-agent /app/caldova-gcp-agent
 COPY a365.generated.config.json /app/a365.generated.config.json
 COPY observability /app/observability
@@ -67,7 +69,7 @@ ENV ENABLE_OBSERVABILITY=true
 ENV ENABLE_A365_OBSERVABILITY_EXPORTER=true
 ENV A365_USE_S2S_ENDPOINT=true
 EXPOSE 8080
-CMD ["/app/caldova-gcp-agent", "web", "-port", "8080", "agentengine"]
+CMD ["/app/caldova-gcp-agent", "web", "-host", "0.0.0.0", "-port", "8080", "agentengine"]
 '@ | Set-Content -Encoding ascii (Join-Path $stage "Dockerfile")
 
     $archive = Join-Path ([System.IO.Path]::GetTempPath()) "caldova-vertex-archive.tgz"
@@ -107,7 +109,7 @@ CMD ["/app/caldova-gcp-agent", "web", "-port", "8080", "agentengine"]
     $body | ConvertTo-Json -Depth 30 -Compress | Set-Content -Encoding ascii $jsonPath
 
     $token = gcloud auth print-access-token
-    $parent = "https://$location-aiplatform.googleapis.com/v1beta1/projects/$projectId/locations/$location/reasoningEngines"
+    $parent = "https://$location-aiplatform.googleapis.com/v1/projects/$projectId/locations/$location/reasoningEngines"
     $existingId = "5806617938186207232"
     $generatedEarly = Join-Path (Get-Location) "a365.generated.config.json"
     if (Test-Path $generatedEarly) {
@@ -129,7 +131,7 @@ CMD ["/app/caldova-gcp-agent", "web", "-port", "8080", "agentengine"]
         $create = Invoke-RestMethod -Method Post -Uri $parent -Headers @{ Authorization = "Bearer $token" } -ContentType "application/json" -InFile $jsonPath
     }
     Write-Host "Operation: $($create.name)"
-    $opUri = "https://$location-aiplatform.googleapis.com/v1beta1/$($create.name)"
+    $opUri = "https://$location-aiplatform.googleapis.com/v1/$($create.name)"
     $done = $false
     for ($i = 0; $i -lt 40 -and -not $done; $i++) {
         Start-Sleep -Seconds 30
