@@ -511,10 +511,11 @@ func repair(ctx context.Context, cfg config.Config, token, sponsorID, signedIn s
 }
 
 func configureBlueprint(ctx context.Context, token, blueprintID string, cfg config.Config, access map[string]any) error {
-	_, err := graphJSON(ctx, token, http.MethodPatch, "https://graph.microsoft.com/v1.0/applications/microsoft.graph.agentIdentityBlueprint/"+url.PathEscape(blueprintID), map[string]any{
-		"requiredResourceAccess": []any{access},
-	})
-	if err != nil {
+	endpoint := "https://graph.microsoft.com/v1.0/applications/microsoft.graph.agentIdentityBlueprint/" + url.PathEscape(cfg.ClientID)
+	if cfg.ClientID == "" {
+		endpoint = "https://graph.microsoft.com/v1.0/applications/microsoft.graph.agentIdentityBlueprint/" + url.PathEscape(blueprintID)
+	}
+	if err := mergeRequiredAccess(ctx, token, endpoint, []map[string]any{access}); err != nil {
 		return fmt.Errorf("blueprint permission update failed: %w", err)
 	}
 	_ = cfg
@@ -540,9 +541,7 @@ func ensureRuntimeClient(ctx context.Context, token string, cfg config.Config, e
 		objectID, err := applicationObjectID(ctx, token, existing)
 		if err == nil && objectID != "" {
 			if access != nil {
-				if _, err := graphJSON(ctx, token, http.MethodPatch, "https://graph.microsoft.com/v1.0/applications/"+url.PathEscape(objectID), map[string]any{
-					"requiredResourceAccess": []any{access},
-				}); err != nil {
+				if err := mergeRequiredAccess(ctx, token, "https://graph.microsoft.com/v1.0/applications/"+url.PathEscape(objectID), []map[string]any{access}); err != nil {
 					return existing, fmt.Errorf("runtime permission update failed: %w", err)
 				}
 			}
@@ -717,6 +716,9 @@ func Sync(ctx context.Context, cfg config.Config) error {
 	if err := grantAdminConsent(ctx, token, principalID); err != nil {
 		return fmt.Errorf("blueprint consent was not updated: %w", err)
 	}
+	if err := GrantCatalog(ctx, token, cfg); err != nil {
+		return err
+	}
 	if err := publishAgentCard(ctx, token, cfg.AgentID, cfg); err != nil {
 		return err
 	}
@@ -767,6 +769,11 @@ func agentCard(cfg config.Config) map[string]any {
 			skill("purview_record_prompt", "Record the user prompt", "Sends the user prompt to Purview as an uploadText interaction and records the matching content activity.", []string{"purview", "prompt"}, []string{"Record this prompt in Purview"}),
 			skill("purview_record_response", "Record the agent response", "Sends the agent response to Purview as a downloadText interaction and records the matching content activity.", []string{"purview", "response"}, []string{"Record this response in Purview"}),
 			skill("purview_evaluate_content", "Evaluate sensitive content", "Submits message text and file bytes to Purview processContent before mail or Teams actions. A block skips the outbound action.", []string{"purview", "dlp"}, []string{"Check the DocSite file against Purview before sending it"}),
+			skill("workiq_onedrive", "Work IQ OneDrive", "Calls the Agent 365 Work IQ OneDrive MCP server. Use list to discover tools, then getOnedrive, getFolderChildrenInMyOnedrive, findFileOrFolderInMyOnedrive, getFileOrFolderMetadataInMyOnedrive, or readSmallTextFileFromMyOnedrive.", []string{"workiq", "onedrive"}, []string{"List files in my OneDrive"}),
+			skill("workiq_calendar", "Work IQ Calendar", "Calls the Agent 365 Work IQ Calendar MCP server. Use list, then mcp_CalendarTools_graph_listEvents, mcp_CalendarTools_graph_createEvent, mcp_CalendarTools_graph_acceptEvent, or mcp_CalendarTools_graph_cancelEvent.", []string{"workiq", "calendar"}, []string{"List my calendar events"}),
+			skill("workiq_word", "Work IQ Word", "Calls the Agent 365 Work IQ Word MCP server. Use list, then WordCreateNewDocument, WordGetDocumentContent, or WordCreateNewComment.", []string{"workiq", "word"}, []string{"Read the Word document at this sharing URL"}),
+			skill("workiq_copilot", "Work IQ Copilot", "Calls the Agent 365 Work IQ Copilot MCP server to search Microsoft 365 content when no workload-specific tool applies.", []string{"workiq", "copilot"}, []string{"Search Microsoft 365 for the DocSite credit-card test document"}),
+			skill("workiq_user", "Work IQ User", "Calls the Agent 365 Work IQ User MCP server. Use list, then mcp_graph_getMyManager or mcp_graph_getDirectReports. Do not pass me as userIdentifier.", []string{"workiq", "user"}, []string{"Who is my manager?"}),
 		},
 	}
 }
