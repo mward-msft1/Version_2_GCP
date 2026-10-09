@@ -327,7 +327,29 @@ func scopeNames(raw any) []string {
 	return names
 }
 
-func RuntimeAuth(cfg config.Config) (*auth.Client, error) {
+func RuntimeAuth(cfg config.Config, user string) (*auth.Client, error) {
+	user = strings.ToLower(strings.TrimSpace(user))
+	if user == "" || !cfg.IsTestUser(user) {
+		return nil, fmt.Errorf("Graph sign-in needs CharlotteW or BrookeG")
+	}
+	client, err := runtimeClient(cfg)
+	if err != nil {
+		return nil, err
+	}
+	client.CacheKey = auth.GraphCacheKey(cfg.RuntimeClientID, user)
+	return client, nil
+}
+
+func LegacyRuntimeAuth(cfg config.Config) (*auth.Client, error) {
+	client, err := runtimeClient(cfg)
+	if err != nil {
+		return nil, err
+	}
+	client.CacheKey = auth.LegacyGraphCacheKey(cfg.RuntimeClientID)
+	return client, nil
+}
+
+func runtimeClient(cfg config.Config) (*auth.Client, error) {
 	clientID := cfg.RuntimeClientID
 	if clientID == "" {
 		return nil, fmt.Errorf("runtime public client is missing; run register again in the Caldova tenant")
@@ -340,7 +362,6 @@ func RuntimeAuth(cfg config.Config) (*auth.Client, error) {
 		TenantID: cfg.TenantID,
 		ClientID: clientID,
 		Scopes:   runtimeScopes,
-		CacheKey: "runtime:" + clientID,
 		Path:     path,
 	}, nil
 }

@@ -47,3 +47,72 @@ func InstallCache(path, raw string) error {
 func hostedKey(key string) bool {
 	return strings.HasPrefix(key, "runtime:") || strings.HasPrefix(key, "workiq:") || strings.HasPrefix(key, "mcp:")
 }
+
+// GraphCacheKey stores one Graph token per test user. The runtime client is shared.
+func GraphCacheKey(clientID, user string) string {
+	return "runtime:" + strings.TrimSpace(clientID) + ":" + strings.ToLower(strings.TrimSpace(user))
+}
+
+// LegacyGraphCacheKey is the old single Graph slot. It is moved to a user slot and then removed.
+func LegacyGraphCacheKey(clientID string) string {
+	return "runtime:" + strings.TrimSpace(clientID)
+}
+
+func ReadEntry(path, key string) (Token, bool, error) {
+	file, err := loadCache(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return Token{}, false, nil
+		}
+		return Token{}, false, err
+	}
+	tok, ok := file.Entries[key]
+	return tok, ok, nil
+}
+
+func WriteEntry(path, key string, tok Token) error {
+	file, err := loadCache(path)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if file.Entries == nil {
+		file.Entries = map[string]Token{}
+	}
+	file.Entries[key] = tok
+	return saveCache(path, file)
+}
+
+func DeleteEntry(path, key string) error {
+	file, err := loadCache(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	delete(file.Entries, key)
+	return saveCache(path, file)
+}
+
+func loadCache(path string) (cacheFile, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return cacheFile{}, err
+	}
+	var file cacheFile
+	if err := json.Unmarshal(b, &file); err != nil {
+		return cacheFile{}, err
+	}
+	return file, nil
+}
+
+func saveCache(path string, file cacheFile) error {
+	if file.Entries == nil {
+		file.Entries = map[string]Token{}
+	}
+	b, err := json.MarshalIndent(file, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, b, 0o600)
+}
