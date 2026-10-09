@@ -20,6 +20,8 @@ import (
 	"google.golang.org/genai"
 
 	"github.com/mward-msft1/Version_2_GCP/internal/a365obs"
+	"github.com/mward-msft1/Version_2_GCP/internal/auth"
+	"github.com/mward-msft1/Version_2_GCP/internal/catalog"
 	"github.com/mward-msft1/Version_2_GCP/internal/config"
 	"github.com/mward-msft1/Version_2_GCP/internal/m365"
 	"github.com/mward-msft1/Version_2_GCP/internal/purview"
@@ -30,6 +32,9 @@ import (
 
 func main() {
 	cfg := config.Load()
+	if err := hydrateTokens(cfg); err != nil {
+		log.Fatal(err)
+	}
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
 		case "register":
@@ -87,8 +92,11 @@ func main() {
 			if _, err := workiqAuth.Token(context.Background()); err != nil {
 				log.Fatal(err)
 			}
-			fmt.Println("Signed in to Graph and WorkIQ as", email+". Token cached outside the repository.")
-			fmt.Println("Run login again as the other test user so both CharlotteW and BrookeG have a WorkIQ token.")
+			if err := catalog.Login(context.Background(), cfg, email, catalog.Load("ToolingManifest.json")); err != nil {
+				log.Fatal(err)
+			}
+			fmt.Println("Signed in to Graph, WorkIQ, and the Work IQ catalog as", email+". Token cached outside the repository.")
+			fmt.Println("Run login again as the other test user so both CharlotteW and BrookeG have catalog tokens.")
 			return
 		case "test":
 			if err := runTest(cfg); err != nil {
@@ -128,15 +136,10 @@ func main() {
 		log.Fatalf("create model: %v", err)
 	}
 	runner := &scenario.Runner{
-		Config: cfg,
-		Graph:  &m365.Client{},
-		Purview: &purview.Client{
-			AppID:           firstNonEmpty(cfg.RuntimeClientID, cfg.ClientID),
-			AppName:         cfg.AgentName,
-			BlueprintID:     cfg.BlueprintID,
-			AgentIdentityID: cfg.AgentIdentityID,
-		},
-		WorkIQ: &workiq.Client{URL: cfg.WorkIQMCPURL},
+		Config:  cfg,
+		Graph:   &m365.Client{},
+		Purview: newPurview(cfg),
+		WorkIQ:  &workiq.Client{URL: cfg.WorkIQMCPURL},
 	}
 	dlpTool, err := functiontool.New(functiontool.Config{
 		Name:        "run_dlp_test",
@@ -150,26 +153,60 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	catalogServers := catalog.Load("ToolingManifest.json")
+	catalogClient := &catalog.Client{Servers: catalogServers}
+	tools := []tool.Tool{dlpTool}
+	for _, spec := range []struct {
+		alias string
+		desc  string
+	}{
+		{"onedrive", "Calls the Agent 365 Work IQ OneDrive MCP server. Pass tool=list to discover tools, or a catalog tool name such as getOnedrive or findFileOrFolderInMyOnedrive."},
+		{"calendar", "Calls the Agent 365 Work IQ Calendar MCP server. Pass tool=list, or a catalog tool such as mcp_CalendarTools_graph_listEvents."},
+		{"word", "Calls the Agent 365 Work IQ Word MCP server. Pass tool=list, or a catalog tool such as WordGetDocumentContent."},
+		{"copilot", "Calls the Agent 365 Work IQ Copilot MCP server when no workload-specific tool applies. Pass tool=copilot_chat and arguments.message. Do not use question. Do not attach file contents."},
+		{"user", "Calls the Agent 365 Work IQ User MCP server. Pass tool=list, or mcp_graph_getMyManager / mcp_graph_getDirectReports. Do not pass me as userIdentifier."},
+	} {
+		alias := spec.alias
+		catalogTool, toolErr := functiontool.New(functiontool.Config{
+			Name:        "workiq_" + alias,
+			Description: spec.desc,
+		}, func(ctx agent.Context, req catalog.Request) (catalog.Result, error) {
+			if err := bindCatalog(cfg, runner, catalogClient); err != nil {
+				return catalog.Result{}, err
+			}
+			return catalogClient.Invoke(ctx, alias, req)
+		})
+		if toolErr != nil {
+			log.Fatal(toolErr)
+		}
+		tools = append(tools, catalogTool)
+	}
 
-	instruction := cfg.Instructions + " You are Caldova GCP Agent Version 2. When the user asks you to run the test, call run_dlp_test. Use only the approved test users and the approved external recipient. If Purview blocks an action, report the block and do not retry that action. A block is a successful DLP test."
+	instruction := cfg.Instructions + " You are Caldova GCP Agent Version 2. When the user asks you to run the test, call run_dlp_test. For OneDrive, Calendar, Word, Copilot, or the signed-in user, call workiq_onedrive, workiq_calendar, workiq_word, workiq_copilot, or workiq_user. Use only the approved test users and the approved external recipient. If Purview blocks an action, report the block and do not retry that action. A block is a successful DLP test."
 	a, err := llmagent.New(llmagent.Config{
 		Name:        cfg.AgentID,
 		Model:       modelClient,
 		Description: cfg.Description,
 		Instruction: instruction,
-		Tools:       []tool.Tool{dlpTool},
+		Tools:       tools,
 		BeforeModelCallbacks: []llmagent.BeforeModelCallback{
 			func(ctx agent.Context, req *model.LLMRequest) (*model.LLMResponse, error) {
+				// [purview] PurviewGuard input gate. processContent runs before the LLM.
+				if !runner.Purview.Enabled() {
+					return nil, nil
+				}
 				if err := bindToken(cfg, runner); err != nil {
 					emitTurn(ctx, cfg, runner, requestText(req), "Purview or sign-in blocked this interaction: "+err.Error())
 					return blocked(err.Error()), nil
 				}
 				decision, err := runner.Purview.EvaluatePrompt(ctx, requestText(req))
-				if err != nil {
-					return blocked(err.Error()), nil
-				}
-				if !decision.Allowed {
-					return blocked(decision.Reason), nil
+				if err != nil || !decision.Allowed {
+					reason := decision.Reason
+					if err != nil {
+						reason = err.Error()
+					}
+					emitTurn(ctx, cfg, runner, requestText(req), "Purview blocked this interaction: "+reason)
+					return blocked(reason), nil
 				}
 				return nil, nil
 			},
@@ -180,7 +217,22 @@ func main() {
 					return nil, nil
 				}
 				responseText := contentText(resp.Content)
-				_, _ = runner.Purview.EvaluateResponse(ctx, responseText)
+				// [purview] PurviewGuard output audit. Withhold the reply when PURVIEW_CHECK_OUTPUT=true.
+				if runner.Purview.OutputEnabled() {
+					if err := bindToken(cfg, runner); err != nil {
+						emitTurn(ctx, cfg, runner, "Agent model turn", "Purview withheld the response: "+err.Error())
+						return blocked(err.Error()), nil
+					}
+					decision, err := runner.Purview.EvaluateResponse(ctx, responseText)
+					if err != nil || !decision.Allowed {
+						reason := decision.Reason
+						if err != nil {
+							reason = err.Error()
+						}
+						emitTurn(ctx, cfg, runner, "Agent model turn", "Purview withheld the response: "+reason)
+						return blocked(reason), nil
+					}
+				}
 				emitTurn(ctx, cfg, runner, "Agent model turn", responseText)
 				return nil, nil
 			},
@@ -211,7 +263,7 @@ func bindToken(cfg config.Config, runner *scenario.Runner) error {
 	if err != nil {
 		return err
 	}
-	token, err := authClient.CachedToken()
+	token, err := authClient.Refresh(context.Background())
 	if err != nil {
 		return fmt.Errorf("sign in with `go run . login` as CharlotteW or BrookeG before running the test")
 	}
@@ -224,6 +276,29 @@ func bindToken(cfg config.Config, runner *scenario.Runner) error {
 		runner.Purview.UserEmail = cfg.ActingUser
 	}
 	return nil
+}
+
+func bindCatalog(cfg config.Config, runner *scenario.Runner, client *catalog.Client) error {
+	if err := bindToken(cfg, runner); err != nil {
+		return err
+	}
+	_, email, err := runner.Graph.Me(context.Background())
+	if err != nil {
+		return fmt.Errorf("could not read the signed-in user for Work IQ catalog tools: %w", err)
+	}
+	tokens, tokenErr := catalog.CachedTokens(context.Background(), cfg, email, client.Servers)
+	client.Tokens = tokens
+	client.Inspector = func(ctx context.Context, text string) (bool, string, error) {
+		if runner.Purview == nil || !runner.Purview.Enabled() {
+			return true, "", nil
+		}
+		decision, inspectErr := runner.Purview.EvaluatePrompt(ctx, text)
+		if inspectErr != nil {
+			return false, inspectErr.Error(), inspectErr
+		}
+		return decision.Allowed, decision.Reason, nil
+	}
+	return tokenErr
 }
 
 func emitTurn(ctx context.Context, cfg config.Config, runner *scenario.Runner, input, output string) {
@@ -303,15 +378,10 @@ func interactiveArgs() bool {
 
 func runTest(cfg config.Config) error {
 	runner := &scenario.Runner{
-		Config: cfg,
-		Graph:  &m365.Client{},
-		Purview: &purview.Client{
-			AppID:           firstNonEmpty(cfg.RuntimeClientID, cfg.ClientID),
-			AppName:         cfg.AgentName,
-			BlueprintID:     cfg.BlueprintID,
-			AgentIdentityID: cfg.AgentIdentityID,
-		},
-		WorkIQ: &workiq.Client{URL: cfg.WorkIQMCPURL},
+		Config:  cfg,
+		Graph:   &m365.Client{},
+		Purview: newPurview(cfg),
+		WorkIQ:  &workiq.Client{URL: cfg.WorkIQMCPURL},
 	}
 	if err := bindToken(cfg, runner); err != nil {
 		return err
@@ -349,16 +419,26 @@ func runTest(cfg config.Config) error {
 	return err
 }
 
+func hydrateTokens(cfg config.Config) error {
+	raw := strings.TrimSpace(os.Getenv("CALDOVA_TOKEN_CACHE"))
+	if raw == "" {
+		return nil
+	}
+	path, err := cfg.TokenPath()
+	if err != nil {
+		return err
+	}
+	if err := auth.InstallCache(path, raw); err != nil {
+		return fmt.Errorf("could not load the hosted token cache")
+	}
+	return nil
+}
+
 func runPrompts(cfg config.Config) error {
 	runner := &scenario.Runner{
-		Config: cfg,
-		Graph:  &m365.Client{},
-		Purview: &purview.Client{
-			AppID:           firstNonEmpty(cfg.RuntimeClientID, cfg.ClientID),
-			AppName:         cfg.AgentName,
-			BlueprintID:     cfg.BlueprintID,
-			AgentIdentityID: cfg.AgentIdentityID,
-		},
+		Config:  cfg,
+		Graph:   &m365.Client{},
+		Purview: newPurview(cfg),
 	}
 	if err := bindToken(cfg, runner); err != nil {
 		return err
@@ -492,6 +572,20 @@ func validate(cfg config.Config) error {
 	fmt.Println(platform)
 	fmt.Println("local validation passed. Agent 365 objects are checked above from the Caldova admin token. Vertex deploy still needs gcloud signed in as the GCP account. This process will not use the corporate Azure CLI session and will not accept a pasted password.")
 	return nil
+}
+
+func newPurview(cfg config.Config) *purview.Client {
+	appID := os.Getenv("PURVIEW_APP_ID")
+	if appID == "" {
+		appID = firstNonEmpty(cfg.RuntimeClientID, cfg.ClientID, cfg.BlueprintID)
+	}
+	return &purview.Client{
+		AppID:           appID,
+		AppName:         firstNonEmpty(os.Getenv("PURVIEW_APP_NAME"), cfg.AgentName),
+		BlueprintID:     cfg.BlueprintID,
+		AgentIdentityID: cfg.AgentIdentityID,
+		Guard:           purview.LoadPurviewGuard(),
+	}
 }
 
 func firstNonEmpty(values ...string) string {

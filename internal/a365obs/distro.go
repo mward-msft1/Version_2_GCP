@@ -16,7 +16,8 @@ import (
 
 // ExportRun records one agent invocation with the Microsoft OpenTelemetry Distro
 // and exports it to Agent 365. The distro has no Go package, so this process
-// acquires the app-only token and the Python distro creates the spans.
+// acquires the app-only token and observability/export_run.py runs
+// instrument_observability. That step must export a root invoke_agent span.
 func ExportRun(ctx context.Context, cfg config.Config, run Run) (Result, error) {
 	if cfg.AgentIdentityID == "" || cfg.BlueprintID == "" {
 		return Result{}, fmt.Errorf("agent identity is not loaded; cannot export OpenTelemetry")

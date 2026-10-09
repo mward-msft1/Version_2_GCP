@@ -15,9 +15,10 @@ import (
 )
 
 type Decision struct {
-	Allowed bool   `json:"allowed"`
-	Reason  string `json:"reason"`
-	Status  int    `json:"status"`
+	Allowed     bool   `json:"allowed"`
+	Reason      string `json:"reason"`
+	Status      int    `json:"status"`
+	PolicyBlock bool   `json:"-"`
 }
 
 type Client struct {
@@ -28,6 +29,7 @@ type Client struct {
 	BlueprintID     string
 	AgentIdentityID string
 	HTTP            *http.Client
+	Guard           PurviewGuard
 
 	scopeETag   string
 	correlation string
@@ -68,8 +70,11 @@ func (c *Client) EvaluateResponse(ctx context.Context, text string) (Decision, e
 // uploadText is the user prompt. downloadText is the agent response. The same
 // correlation ID and increasing sequence number pair the two in Activity explorer.
 func (c *Client) Inspect(ctx context.Context, activity, text, correlationID string, sequence int) (Decision, error) {
+	if !c.Enabled() {
+		return Decision{Allowed: true, Reason: "[purview] PURVIEW_DLP_ENABLED is false"}, nil
+	}
 	if strings.TrimSpace(c.Token) == "" {
-		return Decision{Allowed: false, Reason: "no Microsoft Graph token; run login before the DLP test"}, nil
+		return c.closed(Decision{Allowed: false, Reason: "[purview] no Microsoft Graph token; run login before the DLP test"}), nil
 	}
 	decision, err := c.processContent(ctx, activity, text, correlationID, sequence)
 	if err != nil {
@@ -82,18 +87,41 @@ func (c *Client) Inspect(ctx context.Context, activity, text, correlationID stri
 }
 
 func (c *Client) processContent(ctx context.Context, activity, text, correlationID string, sequence int) (Decision, error) {
+	if len(text) > maxContentChars {
+		return c.closed(Decision{Allowed: false, Reason: "[purview] content exceeds 100000 characters"}), nil
+	}
 	payload := c.payload(activity, text, correlationID, sequence, true)
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return Decision{}, err
 	}
 	c.refreshScopes(ctx)
-	endpoint := c.endpoint("processContent")
-	respBody, status, err := c.post(ctx, endpoint, body)
+	// [purview] purview-dlp-integration calls Graph beta processContent as /me
+	// with the delegated Content.Process.User token. Do not send a blueprint
+	// app-only token; Graph strips Content.Process.* from it.
+	guard := c.guard()
+	callCtx, cancel := context.WithTimeout(ctx, guard.Timeout)
+	defer cancel()
+	respBody, status, err := c.post(callCtx, processContentEndpoint(), body)
 	if err != nil {
-		return Decision{Allowed: false, Reason: "Purview processContent request failed: " + err.Error()}, nil
+		return c.closed(Decision{Allowed: false, Reason: "[purview] processContent request failed: " + err.Error()}), nil
 	}
-	return Decide(status, respBody), nil
+	return c.closed(Decide(status, respBody)), nil
+}
+
+func processContentEndpoint() string {
+	return "https://graph.microsoft.com/beta/me/dataSecurityAndGovernance/processContent"
+}
+
+func (c *Client) closed(decision Decision) Decision {
+	// A published restrictAccess block always stops the turn. Fail-open applies
+	// only to errors, timeouts, and missing inline decisions.
+	if decision.Allowed || decision.PolicyBlock || c.guard().FailClosed {
+		return decision
+	}
+	decision.Allowed = true
+	decision.Reason = "fail-open: " + decision.Reason
+	return decision
 }
 
 func (c *Client) recordActivity(ctx context.Context, activity, correlationID string, sequence int) string {
@@ -124,10 +152,10 @@ func (c *Client) payload(activity, text, correlationID string, sequence int, inc
 	entry := map[string]any{
 		"@odata.type":      "microsoft.graph.processConversationMetadata",
 		"identifier":       uuid.NewString(),
-		"name":             c.AppName,
+		"name":             c.entryName(),
 		"correlationId":    correlationID,
 		"sequenceNumber":   sequence,
-		"isTruncated":      len(text) > 12000,
+		"isTruncated":      false,
 		"createdDateTime":  now,
 		"modifiedDateTime": now,
 		"agents":           c.agents(),
@@ -136,21 +164,13 @@ func (c *Client) payload(activity, text, correlationID string, sequence int, inc
 		entry["contentCategory"] = "ai"
 		entry["content"] = map[string]any{
 			"@odata.type": "microsoft.graph.textContent",
-			"data":        truncate(text, 12000),
+			"data":        text,
 		}
 	}
 	return map[string]any{
 		"contentToProcess": map[string]any{
 			"contentEntries":   []any{entry},
 			"activityMetadata": map[string]any{"activity": activity},
-			"deviceMetadata": map[string]any{
-				"operatingSystemSpecifications": map[string]any{
-					"operatingSystemPlatform": "Windows 11",
-					"operatingSystemVersion":  "10.0.26100.0",
-				},
-				"deviceType": "Unmanaged",
-				"ipAddress":  "127.0.0.1",
-			},
 			"protectedAppMetadata": map[string]any{
 				"name":    c.AppName,
 				"version": "2.0",
@@ -211,6 +231,14 @@ func (c *Client) activityPayload(activity, correlationID string, sequence int) m
 			},
 		},
 	}
+}
+
+func (c *Client) entryName() string {
+	name := strings.TrimSpace(c.AppName)
+	if name == "" {
+		name = "AI Agent"
+	}
+	return name + " message"
 }
 
 func (c *Client) agents() []any {
@@ -307,7 +335,7 @@ func (c *Client) refreshScopes(ctx context.Context) {
 func Decide(status int, body []byte) Decision {
 	switch status {
 	case http.StatusNoContent:
-		return Decision{Allowed: true, Status: status, Reason: "Purview returned no policy action"}
+		return Decision{Allowed: false, Status: status, Reason: "[purview] graph 204: no inline policy decision"}
 	case http.StatusAccepted:
 		return Decision{Allowed: false, Status: status, Reason: "Purview accepted the content asynchronously and did not return a block/allow decision"}
 	}
@@ -327,7 +355,7 @@ func Decide(status int, body []byte) Decision {
 		return Decision{Allowed: false, Status: status, Reason: "Purview processingErrors: " + truncate(string(body), 500)}
 	}
 	if len(parsed.PolicyActions) > 0 || strings.Contains(strings.ToLower(string(body)), "restrictaccess") {
-		return Decision{Allowed: false, Status: status, Reason: "Purview DLP policy action blocked the activity"}
+		return Decision{Allowed: false, PolicyBlock: true, Status: status, Reason: "Purview DLP policy action blocked the activity"}
 	}
 	return Decision{Allowed: true, Status: status, Reason: "Purview returned no restrictive policy action"}
 }

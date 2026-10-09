@@ -5,6 +5,11 @@ $credPath = Join-Path $env:APPDATA "caldova-gcp-agent\blueprint-credential.json"
 if (-not (Test-Path $credPath)) { throw "Blueprint credential is missing. Run activity once locally before deploying hosted telemetry." }
 $blueprintSecret = [string](Get-Content -Raw $credPath | ConvertFrom-Json).secretText
 if (-not $blueprintSecret) { throw "Blueprint credential has no secret. Hosted Agent 365 telemetry cannot start." }
+$tokenPath = Join-Path $env:APPDATA "caldova-gcp-agent\tokens.json"
+if (-not (Test-Path $tokenPath)) { throw "Token cache is missing. Run login before deploying hosted user tokens." }
+$hostedTokenCache = & go run ./internal/auth/cmd/hostedcache $tokenPath
+if ($LASTEXITCODE -ne 0 -or -not $hostedTokenCache) { throw "Could not prepare the hosted token cache." }
+if ($hostedTokenCache -match "register-caldova") { throw "Hosted token cache still contains the registration token." }
 
 $projectNumber = "833485904895"
 $location = if ($env:GOOGLE_CLOUD_LOCATION) { $env:GOOGLE_CLOUD_LOCATION } else { "us-central1" }
@@ -99,7 +104,12 @@ CMD ["/app/caldova-gcp-agent", "web", "-host", "0.0.0.0", "-port", "8080", "agen
                     @{ name = "ENABLE_OBSERVABILITY"; value = "true" }
                     @{ name = "ENABLE_A365_OBSERVABILITY_EXPORTER"; value = "true" }
                     @{ name = "A365_USE_S2S_ENDPOINT"; value = "true" }
+                    @{ name = "PURVIEW_DLP_ENABLED"; value = "true" }
+                    @{ name = "PURVIEW_CHECK_OUTPUT"; value = "true" }
+                    @{ name = "PURVIEW_FAIL_MODE"; value = "closed" }
+                    @{ name = "PURVIEW_TIMEOUT_MS"; value = "15000" }
                     @{ name = "A365_BLUEPRINT_SECRET"; value = $blueprintSecret }
+                    @{ name = "CALDOVA_TOKEN_CACHE"; value = $hostedTokenCache }
                 )
             }
             classMethods = $methods
