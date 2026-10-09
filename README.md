@@ -31,7 +31,7 @@ go run . login
 go run . console
 ```
 
-`register` must be completed as `admin@caldova56317036.onmicrosoft.com`. The Agent 365 blueprint cannot use device code, so `login` uses the Caldova runtime public client written to `a365.generated.config.json`, then the WorkIQ public client, then one device code for each Work IQ catalog audience. Sign in once as CharlotteW and once as BrookeG. Do not point `AZURE_CLIENT_ID` at the blueprint. Do not paste a password into the chat.
+`register` must be completed as `admin@caldova56317036.onmicrosoft.com`. The Agent 365 blueprint cannot use device code, so `login` uses the Caldova runtime public client written to `a365.generated.config.json`, then the WorkIQ public client, then one device code for each Work IQ catalog audience. Graph tokens are stored per test user, so CharlotteW and BrookeG each have a slot. Use `go run . login <user> graph` to refresh only that user's Graph token. Do not point `AZURE_CLIENT_ID` at the blueprint. Do not paste a password into the chat.
 
 Say "run the DLP test" in the console.
 

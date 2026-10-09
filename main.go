@@ -51,24 +51,20 @@ func main() {
 			fmt.Fprintln(os.Stderr, result.AdminConsentURL)
 			return
 		case "login":
-			authClient, err := register.RuntimeAuth(cfg)
+			if len(os.Args) < 3 || !cfg.IsTestUser(os.Args[2]) {
+				log.Fatal("usage: go run . login <CharlotteW or BrookeG email> [graph]")
+			}
+			expected := os.Args[2]
+			graphOnly := len(os.Args) > 3 && strings.EqualFold(os.Args[3], "graph")
+			if err := adoptLegacyGraph(context.Background(), cfg); err != nil {
+				log.Printf("legacy Graph token was left in place: %s", err.Error())
+			}
+			authClient, err := register.RuntimeAuth(cfg, expected)
 			if err != nil {
 				log.Fatal(err)
 			}
-			expected := ""
-			if len(os.Args) > 2 {
-				expected = os.Args[2]
-				if !cfg.IsTestUser(expected) {
-					log.Fatalf("%s is not CharlotteW or BrookeG", expected)
-				}
-			}
-			var token string
 			previous, hadPrevious := authClient.Snapshot()
-			if expected != "" {
-				token, err = authClient.DeviceToken(context.Background())
-			} else {
-				token, err = authClient.Token(context.Background())
-			}
+			token, err := authClient.DeviceToken(context.Background())
 			if err != nil {
 				log.Fatal(err)
 			}
@@ -76,14 +72,15 @@ func main() {
 			if err != nil {
 				log.Fatal(err)
 			}
-			if expected != "" && !strings.EqualFold(email, expected) {
+			if !strings.EqualFold(email, expected) {
 				if hadPrevious {
 					_ = authClient.Restore(previous)
 				}
-				log.Fatalf("signed in as %s, expected %s. The previous Graph token was restored.", email, expected)
+				log.Fatalf("signed in as %s, expected %s. That user's previous Graph token was restored.", email, expected)
 			}
-			if !cfg.IsTestUser(email) {
-				log.Fatalf("signed-in user %s is not CharlotteW or BrookeG", email)
+			if graphOnly {
+				fmt.Println("Graph token cached for", email+". Other user slots were not changed.")
+				return
 			}
 			workiqAuth, err := workiq.Auth(cfg, email)
 			if err != nil {
@@ -96,7 +93,7 @@ func main() {
 				log.Fatal(err)
 			}
 			fmt.Println("Signed in to Graph, WorkIQ, and the Work IQ catalog as", email+". Token cached outside the repository.")
-			fmt.Println("Run login again as the other test user so both CharlotteW and BrookeG have catalog tokens.")
+			fmt.Println("Run login again as the other test user so both CharlotteW and BrookeG have their own Graph slots.")
 			return
 		case "test":
 			if err := runTest(cfg); err != nil {
@@ -145,6 +142,12 @@ func main() {
 		Name:        "run_dlp_test",
 		Description: "Runs the DocSite DLP test: Purview inspection, then email to CharlotteW and BrookeG and the approved external recipient, plus a Teams chat with each of them and a Teams channel post. A Purview block is a successful test and stops that action.",
 	}, func(ctx agent.Context, req scenario.Request) (scenario.Report, error) {
+		if req.ActingUser != "" {
+			if !cfg.IsTestUser(req.ActingUser) {
+				return scenario.Report{}, fmt.Errorf("acting user %s is not CharlotteW or BrookeG", req.ActingUser)
+			}
+			runner.Config.ActingUser = req.ActingUser
+		}
 		if err := bindToken(cfg, runner); err != nil {
 			return scenario.Report{}, err
 		}
@@ -259,23 +262,72 @@ func main() {
 }
 
 func bindToken(cfg config.Config, runner *scenario.Runner) error {
-	authClient, err := register.RuntimeAuth(cfg)
+	user := cfg.ActingUser
+	if runner != nil && runner.Config.ActingUser != "" {
+		user = runner.Config.ActingUser
+	}
+	if err := adoptLegacyGraph(context.Background(), cfg); err != nil {
+		log.Printf("legacy Graph token was left in place: %s", err.Error())
+	}
+	authClient, err := register.RuntimeAuth(cfg, user)
 	if err != nil {
 		return err
 	}
 	token, err := authClient.Refresh(context.Background())
 	if err != nil {
-		return fmt.Errorf("sign in with `go run . login` as CharlotteW or BrookeG before running the test")
+		return fmt.Errorf("sign in with `go run . login %s graph` before running as that user", user)
 	}
 	runner.Graph.Token = token
 	runner.Purview.Token = token
 	if runner.WorkIQ != nil {
 		runner.WorkIQ.Token = ""
 	}
-	if runner.Purview.UserEmail == "" {
-		runner.Purview.UserEmail = cfg.ActingUser
-	}
+	runner.Purview.UserEmail = user
 	return nil
+}
+
+func adoptLegacyGraph(ctx context.Context, cfg config.Config) error {
+	if cfg.RuntimeClientID == "" {
+		return nil
+	}
+	path, err := cfg.TokenPath()
+	if err != nil {
+		return err
+	}
+	legacyKey := auth.LegacyGraphCacheKey(cfg.RuntimeClientID)
+	tok, ok, err := auth.ReadEntry(path, legacyKey)
+	if err != nil || !ok || (tok.AccessToken == "" && tok.RefreshToken == "") {
+		return err
+	}
+	legacy, err := register.LegacyRuntimeAuth(cfg)
+	if err != nil {
+		return err
+	}
+	token, err := legacy.Refresh(ctx)
+	if err != nil {
+		return err
+	}
+	_, email, err := (&m365.Client{Token: token}).Me(ctx)
+	if err != nil {
+		return err
+	}
+	if !cfg.IsTestUser(email) {
+		return fmt.Errorf("legacy Graph token belongs to %s", email)
+	}
+	refreshed, ok, err := auth.ReadEntry(path, legacyKey)
+	if err != nil || !ok {
+		return err
+	}
+	userClient, err := register.RuntimeAuth(cfg, email)
+	if err != nil {
+		return err
+	}
+	if _, exists := userClient.Snapshot(); !exists {
+		if err := userClient.Restore(refreshed); err != nil {
+			return err
+		}
+	}
+	return auth.DeleteEntry(path, legacyKey)
 }
 
 func bindCatalog(cfg config.Config, runner *scenario.Runner, client *catalog.Client) error {
@@ -383,6 +435,11 @@ func runTest(cfg config.Config) error {
 		Purview: newPurview(cfg),
 		WorkIQ:  &workiq.Client{URL: cfg.WorkIQMCPURL},
 	}
+	if len(os.Args) > 2 && cfg.IsTestUser(os.Args[2]) {
+		cfg.ActingUser = os.Args[2]
+		runner.Config.ActingUser = os.Args[2]
+		os.Args = append([]string{os.Args[0], os.Args[1]}, os.Args[3:]...)
+	}
 	if err := bindToken(cfg, runner); err != nil {
 		return err
 	}
@@ -439,6 +496,10 @@ func runPrompts(cfg config.Config) error {
 		Config:  cfg,
 		Graph:   &m365.Client{},
 		Purview: newPurview(cfg),
+	}
+	if len(os.Args) > 2 && cfg.IsTestUser(os.Args[2]) {
+		cfg.ActingUser = os.Args[2]
+		runner.Config.ActingUser = os.Args[2]
 	}
 	if err := bindToken(cfg, runner); err != nil {
 		return err

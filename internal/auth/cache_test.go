@@ -28,3 +28,19 @@ func TestHostedCacheDropsRegistrationToken(t *testing.T) {
 		t.Fatalf("hosted cache kept an access token: %s", filtered)
 	}
 }
+
+func TestHostedCacheKeepsBothGraphUsers(t *testing.T) {
+	raw := `{
+	  "entries": {
+	    "runtime:client:charlottew@caldova56317036.onmicrosoft.com": {"refresh_token": "charlotte-refresh"},
+	    "runtime:client:brookeg@caldova56317036.onmicrosoft.com": {"refresh_token": "brooke-refresh"}
+	  }
+	}`
+	filtered, err := HostedCache(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(filtered, "charlotte-refresh") || !strings.Contains(filtered, "brooke-refresh") {
+		t.Fatalf("hosted cache dropped a Graph user slot: %s", filtered)
+	}
+}
