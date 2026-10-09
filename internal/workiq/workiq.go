@@ -79,14 +79,39 @@ func (c *Client) Enabled() bool {
 }
 
 func (c *Client) ListDocuments(ctx context.Context, host, sitePath string) (string, []m365.DriveItem, error) {
-	path := fmt.Sprintf("/sites/%s:%s:/drive/root/children?$select=id,name,size,webUrl,file,folder,parentReference&$top=50", host, sitePath)
-	raw, err := c.Fetch(ctx, []string{path})
+	// WorkIQ denies /sites/{host}:{path}:/drive/root/children. Resolve the site
+	// id, then list /drives/{driveId}/items/{rootId}/children. Do not encode the
+	// site id: WorkIQ rejects the encoded commas in a SharePoint site id.
+	term := siteSearchTerm(sitePath)
+	if term == "" {
+		return "", nil, fmt.Errorf("WorkIQ list needs a SharePoint site path")
+	}
+	raw, err := c.Fetch(ctx, []string{"/sites?search=" + url.QueryEscape(term) + "&$select=id,displayName,name,webUrl&$top=5"})
 	if err != nil {
 		return "", nil, err
 	}
-	driveID, files := filesFrom(raw)
+	siteID := siteIDFrom(raw, host, sitePath)
+	if siteID == "" {
+		return "", nil, fmt.Errorf("WorkIQ found no site for %s%s", host, sitePath)
+	}
+	driveRaw, err := c.Fetch(ctx, []string{"/sites/" + siteID + "/drive?$expand=root&$select=id,name,webUrl"})
+	if err != nil {
+		return "", nil, err
+	}
+	driveID, rootID := driveRootFrom(driveRaw)
+	if driveID == "" || rootID == "" {
+		return "", nil, fmt.Errorf("WorkIQ did not return a drive root for %s%s", host, sitePath)
+	}
+	listed, err := c.Fetch(ctx, []string{"/drives/" + driveID + "/items/" + rootID + "/children?$select=id,name,size,webUrl,file,folder,parentReference&$top=50"})
+	if err != nil {
+		return "", nil, err
+	}
+	foundDrive, files := filesFrom(listed)
+	if foundDrive != "" {
+		driveID = foundDrive
+	}
 	if len(files) == 0 {
-		return "", nil, fmt.Errorf("WorkIQ listed no files at %s", path)
+		return "", nil, fmt.Errorf("WorkIQ listed no files at %s%s", host, sitePath)
 	}
 	return driveID, files, nil
 }
@@ -385,6 +410,70 @@ func member(id string) map[string]any {
 		"roles":           []string{"owner"},
 		"user@odata.bind": "https://graph.microsoft.com/v1.0/users('" + strings.ReplaceAll(id, "'", "''") + "')",
 	}
+}
+
+func siteSearchTerm(sitePath string) string {
+	sitePath = strings.Trim(sitePath, "/")
+	if i := strings.LastIndex(sitePath, "/"); i >= 0 {
+		sitePath = sitePath[i+1:]
+	}
+	return strings.TrimSpace(sitePath)
+}
+
+func siteIDFrom(raw json.RawMessage, host, sitePath string) string {
+	return walkSite(decodeLoose(raw), strings.ToLower(host), strings.ToLower(strings.TrimRight(sitePath, "/")), strings.ToLower(siteSearchTerm(sitePath)))
+}
+
+func walkSite(v any, host, sitePath, name string) string {
+	switch t := v.(type) {
+	case map[string]any:
+		id := asString(t["id"])
+		web := strings.ToLower(asString(t["webUrl"]))
+		display := strings.ToLower(asString(t["displayName"]))
+		siteName := strings.ToLower(asString(t["name"]))
+		if id != "" && (strings.Contains(web, host+sitePath) || siteName == name || display == name) {
+			return id
+		}
+		for _, child := range t {
+			if found := walkSite(child, host, sitePath, name); found != "" {
+				return found
+			}
+		}
+	case []any:
+		for _, child := range t {
+			if found := walkSite(child, host, sitePath, name); found != "" {
+				return found
+			}
+		}
+	}
+	return ""
+}
+
+func driveRootFrom(raw json.RawMessage) (string, string) {
+	return walkDrive(decodeLoose(raw))
+}
+
+func walkDrive(v any) (string, string) {
+	switch t := v.(type) {
+	case map[string]any:
+		if root, ok := t["root"].(map[string]any); ok {
+			if id, rootID := asString(t["id"]), asString(root["id"]); id != "" && rootID != "" {
+				return id, rootID
+			}
+		}
+		for _, child := range t {
+			if id, rootID := walkDrive(child); id != "" && rootID != "" {
+				return id, rootID
+			}
+		}
+	case []any:
+		for _, child := range t {
+			if id, rootID := walkDrive(child); id != "" && rootID != "" {
+				return id, rootID
+			}
+		}
+	}
+	return "", ""
 }
 
 func filesFrom(raw json.RawMessage) (string, []m365.DriveItem) {

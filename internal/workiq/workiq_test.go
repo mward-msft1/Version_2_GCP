@@ -30,7 +30,18 @@ func TestHostedToolsForBothUsers(t *testing.T) {
 		case "fetch":
 			urls, _ := call.Params.Arguments["entityUrls"].([]any)
 			path, _ := urls[0].(string)
-			if strings.Contains(path, "DocSite") {
+			switch {
+			case strings.HasPrefix(path, "/sites?search="):
+				writeResult(w, `{"value":[{"id":"site,with,commas","displayName":"DocSite","name":"DocSite","webUrl":"https://caldova56317036.sharepoint.com/sites/DocSite"}]}`)
+				return
+			case strings.Contains(path, "/drive?"):
+				if strings.Contains(path, "%2C") || strings.Contains(path, "%2c") {
+					http.Error(w, "encoded site id", http.StatusBadRequest)
+					return
+				}
+				writeResult(w, `{"id":"drive","name":"Documents","root":{"id":"root"}}`)
+				return
+			case strings.Contains(path, "/drives/drive/items/root/children"):
 				writeResult(w, `{"value":[{"id":"item","name":"sensitive.txt","size":4,"webUrl":"https://example","file":{"mimeType":"text/plain"},"parentReference":{"driveId":"drive"}}]}`)
 				return
 			}

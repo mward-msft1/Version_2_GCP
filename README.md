@@ -13,7 +13,7 @@ When prompted, you need to try and send a file to an approved internal and exter
 - SharePoint library: `https://caldova56317036.sharepoint.com/sites/DocSite`
 - Entra tenant: `b29b0240-e051-4989-8492-cafe1e25f54a`
 - GCP project number: `833485904895`
-- WorkIQ MCP defaults to `https://workiq.svc.cloud.microsoft/mcp`. Listing, download, mail, Teams chat, and Teams channel use `fetch`, `fetch_blob`, `do_action`, and `create_entity` for whichever of CharlotteW or BrookeG is signed in. Graph is the fallback. Set `WORKIQ_MCP_URL=off` to skip WorkIQ.
+- WorkIQ MCP defaults to `https://workiq.svc.cloud.microsoft/mcp`. DocSite listing resolves the site id, then lists `/drives/{driveId}/items/{rootId}/children`. WorkIQ denies the `/sites/{host}:{path}:/drive/root/children` alias. Download, mail, Teams chat, and Teams channel use `fetch_blob`, `do_action`, and `create_entity` for whichever of CharlotteW or BrookeG is signed in. Graph is the fallback. Set `WORKIQ_MCP_URL=off` to skip WorkIQ.
 - Purview must allow an action before mail or Teams runs. A `restrictAccess` result is a successful DLP test and that action is not sent.
 - Prompt and response text is captured only when the Know Your Data collection policy has ingestion enabled for `UploadText` and `DownloadText`.
 - Passwords are never stored. Sign-in is device code only. Tokens stay in the user config directory, outside this repo.
