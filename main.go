@@ -14,12 +14,12 @@ import (
 	"google.golang.org/adk/v2/cmd/launcher/agentengine"
 	"google.golang.org/adk/v2/cmd/launcher/full"
 	"google.golang.org/adk/v2/model"
-	"google.golang.org/adk/v2/model/gemini"
 	"google.golang.org/adk/v2/tool"
 	"google.golang.org/adk/v2/tool/functiontool"
 	"google.golang.org/genai"
 
 	"github.com/mward-msft1/Version_2_GCP/internal/a365obs"
+	"github.com/mward-msft1/Version_2_GCP/internal/aigateway"
 	"github.com/mward-msft1/Version_2_GCP/internal/auth"
 	"github.com/mward-msft1/Version_2_GCP/internal/catalog"
 	"github.com/mward-msft1/Version_2_GCP/internal/config"
@@ -120,18 +120,78 @@ func main() {
 				log.Fatal(err)
 			}
 			return
+		case "gateway":
+			prompt := "Reply with the single word pong."
+			if len(os.Args) > 2 {
+				prompt = strings.Join(os.Args[2:], " ")
+			}
+			reply, err := (aigateway.Client{
+				Host:   cfg.AIGatewayHost,
+				APIKey: cfg.AIGatewayAPIKey,
+				Model:  cfg.AIGatewayModel,
+			}).Chat(context.Background(), prompt)
+			if err != nil {
+				log.Fatal(err)
+			}
+			fmt.Println(reply)
+			return
+		case "gateway-model":
+			llm, err := aigateway.Model(context.Background(), cfg.AIGatewayHost, cfg.AIGatewayModel, cfg.AIGatewayAPIKey)
+			if err != nil {
+				log.Fatal(err)
+			}
+			req := &model.LLMRequest{
+				Contents: []*genai.Content{genai.NewContentFromText("Call the ping tool now. Do not answer in text.", genai.RoleUser)},
+				Config: &genai.GenerateContentConfig{Tools: []*genai.Tool{{
+					FunctionDeclarations: []*genai.FunctionDeclaration{{
+						Name:        "ping",
+						Description: "Returns pong",
+					}},
+				}}},
+			}
+			var names []string
+			var text string
+			stream := len(os.Args) > 2 && os.Args[2] == "stream"
+			for resp, genErr := range llm.GenerateContent(context.Background(), req, stream) {
+				if genErr != nil {
+					log.Fatal(genErr)
+				}
+				if resp != nil && resp.ErrorMessage != "" {
+					log.Fatal(resp.ErrorMessage)
+				}
+				if resp == nil || resp.Content == nil {
+					continue
+				}
+				for _, part := range resp.Content.Parts {
+					if part == nil {
+						continue
+					}
+					if part.FunctionCall != nil {
+						names = append(names, part.FunctionCall.Name)
+					}
+					if part.Text != "" {
+						text = part.Text
+					}
+				}
+			}
+			fmt.Printf("tool=%s text=%s\n", strings.Join(names, ","), text)
+			if !contains(names, "ping") {
+				log.Fatal("gateway model did not call ping")
+			}
+			return
 		}
 	}
 
 	ctx := context.Background()
-	modelClient, err := gemini.NewModel(ctx, envOr("GEMINI_MODEL", "gemini-flash-latest"), &genai.ClientConfig{
-		Backend:  genai.BackendVertexAI,
-		Project:  cfg.GCPProjectID,
-		Location: cfg.Location,
-	})
+	modelName := cfg.AIGatewayModel
+	if modelName == "" {
+		modelName = aigateway.DefaultModel
+	}
+	modelClient, err := aigateway.Model(ctx, cfg.AIGatewayHost, modelName, cfg.AIGatewayAPIKey)
 	if err != nil {
 		log.Fatalf("create model: %v", err)
 	}
+	log.Printf("model: ai-gateway host=%s model=%s", aigateway.BaseURL(cfg.AIGatewayHost), modelName)
 	runner := &scenario.Runner{
 		Config:  cfg,
 		Graph:   &m365.Client{},
@@ -467,7 +527,8 @@ func runTest(cfg config.Config) error {
 	if len(os.Args) > 3 {
 		fileName = os.Args[3]
 	}
-	report, err := runner.Run(context.Background(), scenario.Request{ActingUser: email, FileName: fileName, Only: only})
+	message := os.Getenv("DLP_TEST_MESSAGE")
+	report, err := runner.Run(context.Background(), scenario.Request{ActingUser: email, FileName: fileName, Only: only, Message: message})
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	if encodeErr := enc.Encode(report); encodeErr != nil {
@@ -597,6 +658,11 @@ func promptPairs(acting, fileName, snippet string) [][2]string {
 
 func validate(cfg config.Config) error {
 	fmt.Println("agent:", cfg.AgentName)
+	fmt.Println("model gateway:", aigateway.BaseURL(cfg.AIGatewayHost))
+	fmt.Println("model:", firstNonEmpty(cfg.AIGatewayModel, aigateway.DefaultModel))
+	if cfg.AIGatewayAPIKey == "" {
+		return fmt.Errorf("AI_GATEWAY_API_KEY is not set")
+	}
 	fmt.Println("description:", cfg.Description)
 	fmt.Println("tenant:", cfg.TenantID)
 	fmt.Println("gcp project number:", cfg.GCPProjectNumber)
@@ -656,6 +722,15 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func contains(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func envOr(key, fallback string) string {

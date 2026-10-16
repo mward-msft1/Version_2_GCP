@@ -55,12 +55,16 @@ type Config struct {
 	TeamsTeamID     string
 	TeamsChannelID  string
 	ActingUser      string
+	AIGatewayHost   string
+	AIGatewayModel  string
+	AIGatewayAPIKey string
 	Location        string
 	AgentEngineID   string
 	GeneratedPath   string
 }
 
 func Load() Config {
+	loadDotEnv(".env")
 	cfg := Config{
 		File: File{
 			AgentName:                 AgentDisplayName,
@@ -109,6 +113,9 @@ func Load() Config {
 	if cfg.ActingUser == "" && len(cfg.TestUsers) > 0 {
 		cfg.ActingUser = cfg.TestUsers[0]
 	}
+	cfg.AIGatewayHost = os.Getenv("AI_GATEWAY_HOST")
+	cfg.AIGatewayModel = os.Getenv("AI_GATEWAY_MODEL")
+	cfg.AIGatewayAPIKey = os.Getenv("AI_GATEWAY_API_KEY")
 	cfg.AgentEngineID = os.Getenv("GOOGLE_CLOUD_AGENT_ENGINE_ID")
 	applyGenerated(&cfg)
 	return cfg
@@ -226,6 +233,24 @@ func containsFold(values []string, want string) bool {
 		}
 	}
 	return false
+}
+
+func loadDotEnv(path string) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		line = strings.TrimSpace(strings.TrimRight(line, "\r"))
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok || key == "" || os.Getenv(key) != "" {
+			continue
+		}
+		_ = os.Setenv(key, value)
+	}
 }
 
 func firstEnv(keys ...string) string {

@@ -21,6 +21,16 @@ When prompted, you need to try and send a file to an approved internal and exter
 
 There is no Agent 365 Go SDK. Registration uses the Graph v1.0 agent-identity APIs the A365 CLI uses: agent identity blueprint, blueprint principal, and agent identity. Agent 365 card registration remains the published `beta/copilot/agentRegistrations` API. Telemetry uses the Microsoft OpenTelemetry Distro `microsoft-opentelemetry` 1.4.0. The Python Agent 365 SDK packages are pinned at 1.0.0, the newest stable release. The `purview-dlp-integration` gate calls Graph beta `POST /me/dataSecurityAndGovernance/processContent` with the signed-in user's delegated `Content.Process.User` token. It runs before the model and, when `PURVIEW_CHECK_OUTPUT=true`, audits the reply before it is returned. Errors fail closed. `protectionScopes/compute` and `contentActivities` stay on Graph v1.0. Vertex deploy uses the Agent Engine v1 API. Python packages are `google-cloud-aiplatform` 2.3.0 and `google-adk` 2.10.0. Go libraries are ADK v2.5.0, genai v1.73.0, and `google.golang.org/api` v0.301.0.
 
+## AI Gateway
+
+Model calls for the gateway path go to `merry-meteor-4379`, not `cosmic-lagoon-5920`. The registered model is `gemini-2.5-flash` (`/openai/v1/chat/completions`). The runtime host is `https://merry-meteor-4379.eastus2-01.ai.gateway.azure.com`. Authenticate with the `Api-Key` header from `AI_GATEWAY_API_KEY`. Do not send only `Authorization: Bearer`.
+
+```powershell
+go run . gateway
+```
+
+The key lives in `.env`, which is gitignored. Rotate it in the [AI Gateway portal](https://ai.gateway.azure.com) if it is exposed. The hosted agent uses this gateway for model calls. Purview, Graph, Teams, and Agent 365 telemetry stay on their own endpoints. Vertex deploy injects `AI_GATEWAY_API_KEY` as an environment variable and does not copy `.env` into the image archive.
+
 ## Run
 
 ```powershell
