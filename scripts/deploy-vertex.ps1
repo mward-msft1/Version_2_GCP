@@ -11,6 +11,20 @@ $hostedTokenCache = & go run ./internal/auth/cmd/hostedcache $tokenPath
 if ($LASTEXITCODE -ne 0 -or -not $hostedTokenCache) { throw "Could not prepare the hosted token cache." }
 if ($hostedTokenCache -match "register-caldova") { throw "Hosted token cache still contains the registration token." }
 
+$dotenv = @{}
+if (Test-Path .env) {
+    foreach ($line in Get-Content .env) {
+        if ($line -match '^\s*#' -or $line -notmatch '=') { continue }
+        $key, $value = $line -split '=', 2
+        $dotenv[$key.Trim()] = $value.Trim()
+    }
+}
+$gatewayHost = if ($env:AI_GATEWAY_HOST) { $env:AI_GATEWAY_HOST } elseif ($dotenv.AI_GATEWAY_HOST) { $dotenv.AI_GATEWAY_HOST } else { "https://merry-meteor-4379.eastus2-01.ai.gateway.azure.com" }
+$gatewayModel = if ($env:AI_GATEWAY_MODEL) { $env:AI_GATEWAY_MODEL } elseif ($dotenv.AI_GATEWAY_MODEL) { $dotenv.AI_GATEWAY_MODEL } else { "gemini-2.5-flash" }
+$gatewayKey = if ($env:AI_GATEWAY_API_KEY) { $env:AI_GATEWAY_API_KEY } else { $dotenv.AI_GATEWAY_API_KEY }
+if (-not $gatewayKey) { throw "AI_GATEWAY_API_KEY is missing. Put it in .env before deploying." }
+if ($gatewayHost -notmatch 'merry-meteor-4379') { throw "Refusing to deploy a gateway host other than merry-meteor-4379." }
+
 $projectNumber = "833485904895"
 $location = if ($env:GOOGLE_CLOUD_LOCATION) { $env:GOOGLE_CLOUD_LOCATION } else { "us-central1" }
 if (-not (Get-Command gcloud -ErrorAction SilentlyContinue)) {
@@ -51,8 +65,10 @@ $stage = Join-Path ([System.IO.Path]::GetTempPath()) ("caldova-vertex-" + [guid]
 New-Item -ItemType Directory -Path $stage | Out-Null
 try {
     # Agent Engine rejects source archives over 8 MB. Keep the local build output out.
-    & robocopy . $stage /E /NFL /NDL /NJH /NJS /XD .git bin /XF *.exe | Out-Null
+    # .env holds the live gateway key. Inject it as an environment variable below.
+    & robocopy . $stage /E /NFL /NDL /NJH /NJS /XD .git bin /XF *.exe .env | Out-Null
     if ($LASTEXITCODE -ge 8) { throw "Could not stage the deploy source" }
+    if (Test-Path (Join-Path $stage ".env")) { throw ".env was staged; refusing to deploy the gateway key in the source archive" }
     @'
 FROM golang:1.26.6 AS builder
 ENV GOTOOLCHAIN=auto
@@ -110,6 +126,9 @@ CMD ["/app/caldova-gcp-agent", "web", "-host", "0.0.0.0", "-port", "8080", "agen
                     @{ name = "PURVIEW_TIMEOUT_MS"; value = "15000" }
                     @{ name = "A365_BLUEPRINT_SECRET"; value = $blueprintSecret }
                     @{ name = "CALDOVA_TOKEN_CACHE"; value = $hostedTokenCache }
+                    @{ name = "AI_GATEWAY_HOST"; value = $gatewayHost }
+                    @{ name = "AI_GATEWAY_MODEL"; value = $gatewayModel }
+                    @{ name = "AI_GATEWAY_API_KEY"; value = $gatewayKey }
                 )
             }
             classMethods = $methods

@@ -19,6 +19,7 @@ type Request struct {
 	ActingUser string `json:"actingUser"`
 	FileName   string `json:"fileName,omitempty"`
 	Only       string `json:"only,omitempty"`
+	Message    string `json:"message,omitempty"`
 }
 
 type Step struct {
@@ -64,6 +65,11 @@ func (r *Runner) Run(ctx context.Context, req Request) (report Report, err error
 		}
 	} else {
 		r.Purview.UserEmail = "me"
+	}
+
+	if strings.TrimSpace(req.Message) != "" {
+		r.sendText(ctx, &report, acting, strings.TrimSpace(req.Message), strings.TrimSpace(req.Only))
+		return report, nil
 	}
 
 	fileName := strings.TrimSpace(req.FileName)
@@ -199,6 +205,32 @@ func (r *Runner) Run(ctx context.Context, req Request) (report Report, err error
 		r.tryChannel(ctx, &report, internalUsers, file)
 	}
 	return report, nil
+}
+
+func (r *Runner) sendText(ctx context.Context, report *Report, acting, message, only string) {
+	report.FileName = "attendee-credit-cards.txt"
+	file := m365.FilePayload{
+		Item:    m365.DriveItem{Name: report.FileName},
+		Snippet: message,
+	}
+	subject := "DLP test from Caldova GCP Agent Version 2"
+	internalUsers := r.Config.FunctionUsers(acting)
+	if only == "" || only == "email-internal" {
+		for _, internal := range internalUsers {
+			r.tryMail(ctx, report, "email-internal", internal, nil, subject, message, file)
+		}
+	}
+	if only == "" || only == "email-external" {
+		r.tryMail(ctx, report, "email-external", r.Config.ApprovedExternalRecipient, internalUsers, subject, message, file)
+	}
+	if only == "" || only == "teams-chat" {
+		for _, internal := range internalUsers {
+			r.tryChat(ctx, report, acting, internal, file)
+		}
+	}
+	if only == "" || only == "teams-channel" {
+		r.tryChannel(ctx, report, internalUsers, file)
+	}
 }
 
 func (r *Runner) exportActivity(ctx context.Context, report *Report, userID *string) {
@@ -374,6 +406,9 @@ func pick(files []m365.DriveItem, name string) (m365.DriveItem, bool) {
 }
 
 func messageText(file m365.FilePayload, users []string) string {
+	if file.Link == "" && file.Item.WebURL == "" && file.Snippet != "" {
+		return file.Snippet
+	}
 	link := file.Link
 	if link == "" {
 		link = file.Item.WebURL
@@ -382,6 +417,9 @@ func messageText(file m365.FilePayload, users []string) string {
 }
 
 func messageHTML(file m365.FilePayload, users []string) string {
+	if file.Link == "" && file.Item.WebURL == "" && file.Snippet != "" {
+		return "<p>" + html.EscapeString(file.Snippet) + "</p>"
+	}
 	link := file.Link
 	if link == "" {
 		link = file.Item.WebURL
